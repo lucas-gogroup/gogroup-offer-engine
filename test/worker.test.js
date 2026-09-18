@@ -517,3 +517,60 @@ test('afinidade sobrevive a carrinho com vários itens (ordem dos binds)', async
   assert.ok(!(body.offers || []).some((o) => o.sku === 'KRT99078'));
   assert.equal(body.rejected.find((r) => r.sku === 'KRT99078').code, 'kit_contains_cart_sku');
 });
+
+// ---------------------------------------------------------------------------
+// Isolamento por marca — o que protege Barbour's e Rituária ao plugar a Ápice
+// ---------------------------------------------------------------------------
+
+test('carregar uma marca nova não mexe nas marcas já carregadas', async () => {
+  const env = newEnv();
+  await seed(env);
+  const antes = (await call(env, 'GET', '/health')).body.counts.product;
+
+  await call(env, 'POST', '/curate/product', {
+    rows: [{ brand: 'apice', sku: 'AP001', variant_id: '700001', title: 'Kit Cachos',
+      price: 60, cogs: 15, available: 30, line: 'cachos', category: 'cabelo' }],
+  }, true);
+
+  const depois = await call(env, 'GET', '/health');
+  assert.equal(depois.body.counts.product, antes + 1);
+  const porMarca = Object.fromEntries(depois.body.product_by_brand.map((r) => [r.brand, r.skus]));
+  assert.equal(porMarca.rituaria, 4, 'Rituária intacta');
+  assert.equal(porMarca.barbours, 2, "Barbour's intacta");
+
+  // e a Ápice não vaza para o pool das outras
+  const rit = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', cart: [{ sku: 'RT01008', qty: 1, price: 89.90 }], n: 10,
+  });
+  assert.ok(!(rit.body.offers || []).some((o) => o.sku === 'AP001'));
+});
+
+test('reset COM brand apaga só aquela marca', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/affinity', {
+    rows: [
+      { brand: 'rituaria', anchor_sku: 'RT01008', candidate_sku: 'RT02001', co_purchase_count: 9 },
+      { brand: 'apice', anchor_sku: 'AP001', candidate_sku: 'AP002', co_purchase_count: 4 },
+    ],
+  }, true);
+  assert.equal((await call(env, 'GET', '/health')).body.counts.affinity, 2);
+
+  const r = await call(env, 'POST', '/curate/reset?table=affinity&brand=apice', undefined, true);
+  assert.equal(r.body.brand, 'apice');
+  assert.equal(r.body.remaining, 1, 'sobra a linha da Rituária');
+  const resta = env.DB.prepare('SELECT brand FROM affinity').all();
+  assert.deepEqual(resta.map((x) => x.brand), ['rituaria']);
+});
+
+test('reset SEM brand apaga tudo — é o footgun, e está coberto', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/affinity', {
+    rows: [{ brand: 'rituaria', anchor_sku: 'A', candidate_sku: 'B', co_purchase_count: 1 },
+      { brand: 'apice', anchor_sku: 'C', candidate_sku: 'D', co_purchase_count: 1 }],
+  }, true);
+  const r = await call(env, 'POST', '/curate/reset?table=affinity', undefined, true);
+  assert.equal(r.body.brand, 'all');
+  assert.equal(r.body.remaining, 0, 'sem brand, leva as duas marcas junto');
+});
