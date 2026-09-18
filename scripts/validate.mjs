@@ -79,10 +79,16 @@ check('PORTÃO: a regra é composição, não teto de preço',
 // ---------------------------------------------------------------------------
 const PISO = 0.30;
 let emitidas = 0, furaTeto = 0, furaPiso = 0, semEstoque = 0, autoOferta = 0, semVariant = 0;
+let furaMinPrice = 0, escassezFalsa = 0, jargao = 0;
 const furos = [];
 
 // amostra ampla: usa as próprias âncoras com afinidade carregada
 for (const brand of ['barbours', 'rituaria']) {
+  // O teto é por marca e ajustável em runtime: cravar 0,6 aqui faria o
+  // checklist acusar a própria config da Rituária como violação.
+  const cfg = (await get(`/config?brand=${brand}`)).effective || {};
+  const teto = cfg.price_cap_ratio ?? 0.6;
+  const minPrice = cfg.min_price ?? 15;
   const amostra = await get(`/offers?brand=${brand}&anchor=__none__&n=50`);
   const pool = amostra.offers || [];
   const skus = pool.map((o) => o.sku).slice(0, 25);
@@ -93,7 +99,10 @@ for (const brand of ['barbours', 'rituaria']) {
     const cartTotal = prod.price;
     for (const o of r.offers || []) {
       emitidas++;
-      if (o.price > 0.6 * cartTotal + 1e-9) { furaTeto++; furos.push(`teto: ${brand}/${sku} → ${o.sku} R$${o.price} (carrinho R$${cartTotal})`); }
+      if (o.price > teto * cartTotal + 1e-9) { furaTeto++; furos.push(`teto: ${brand}/${sku} → ${o.sku} R$${o.price} (carrinho R$${cartTotal}, teto ${teto})`); }
+      if (o.price < minPrice) { furaMinPrice++; furos.push(`piso de preço: ${brand}/${o.sku} R$${o.price}`); }
+      if (/^Últimas unidades/.test(o.copy || '')) { escassezFalsa++; furos.push(`escassez: ${o.sku} available=${o.available}`); }
+      if (/INSPIRADOS|CAPSULA|Não se aplica/i.test(o.copy || '')) { jargao++; furos.push(`jargão no copy: ${o.copy}`); }
       if (o.expected_margin < PISO) { furaPiso++; furos.push(`piso: ${brand}/${sku} → ${o.sku} margem ${o.expected_margin}`); }
       if (!(o.available > 0)) { semEstoque++; furos.push(`estoque: ${o.sku} available=${o.available}`); }
       if (o.sku === sku) { autoOferta++; furos.push(`auto-oferta: ${sku}`); }
@@ -102,7 +111,10 @@ for (const brand of ['barbours', 'rituaria']) {
   }
 }
 
-check('nenhuma oferta fura o teto de 60% do carrinho', furaTeto === 0, `${emitidas} ofertas avaliadas`);
+check('nenhuma oferta fura o teto de preço da marca', furaTeto === 0, `${emitidas} ofertas avaliadas`);
+check('nenhuma oferta abaixo do piso de preço (§3.1)', furaMinPrice === 0, `${emitidas} ofertas avaliadas`);
+check('nenhum copy de escassez com a urgência desligada', escassezFalsa === 0, `${emitidas} ofertas avaliadas`);
+check('nenhum rótulo interno de linha na tela do cliente', jargao === 0, `${emitidas} ofertas avaliadas`);
 check('expected_margin ≥ piso da marca em 100% das ofertas', furaPiso === 0, `${emitidas} ofertas avaliadas`);
 check('nenhuma oferta com available ≤ 0', semEstoque === 0);
 check('nenhum SKU do carrinho ofertado a si mesmo', autoOferta === 0);
