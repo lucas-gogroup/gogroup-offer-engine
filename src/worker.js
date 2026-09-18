@@ -17,6 +17,7 @@
 import { adaptDb, ensureSchema } from './db.js';
 import {
   decide, mergeConfig, functionalKey, round2, DEFAULT_CONFIG,
+  parseCollectible, normTax, hashSeed, rngFrom, tsWindow,
 } from './engine.js';
 
 const DEFAULT_ORIGINS = [
@@ -175,6 +176,19 @@ async function runDecision(db, opts) {
          WHERE k.brand = p.brand AND k.kit_sku = p.sku
            AND k.component_sku IN (${inCart}) LIMIT 1)`
     : 'NULL';
+  // Sobreposição kit ∩ kit. `cartSkus` com um KIT dentro contém só o SKU do
+  // kit, então `kit_hit` acima nunca acha o kit vizinho que divide componente:
+  // é preciso comparar contra os COMPONENTES dos kits do carrinho. Sem esta
+  // subquery, o filtro no engine não tem o que filtrar — ele só vê o que a
+  // query trouxe. Mais uma subquery, zero ida a mais ao banco.
+  const overlapHit = cartList.length
+    ? `(SELECT k.component_sku FROM kit_components k
+         WHERE k.brand = p.brand AND k.kit_sku = p.sku
+           AND k.component_sku IN (
+                 SELECT k3.component_sku FROM kit_components k3
+                  WHERE k3.brand = p.brand AND k3.kit_sku IN (${inCart}))
+         LIMIT 1)`
+    : 'NULL';
   const compHit = cartList.length
     ? `(SELECT 1 FROM kit_components k2
          WHERE k2.brand = p.brand AND k2.component_sku = p.sku
@@ -195,7 +209,7 @@ async function runDecision(db, opts) {
   // na cláusula SELECT, portanto antes de todos os JOIN. Inverter isso faz a
   // afinidade voltar zerada em silêncio, sem erro de SQL.
   const prodParams = [];
-  if (cartList.length) prodParams.push(...cartList, ...cartList);
+  if (cartList.length) prodParams.push(...cartList, ...cartList, ...cartList);
   prodParams.push(anchor || '', anchor || '', surface, goal, segment, anchor || '', brand);
 
   const cfgCols = Object.keys(DEFAULT_CONFIG);
@@ -208,8 +222,9 @@ async function runDecision(db, opts) {
             COALESCE(os.impressions, 0)      AS impressions,
             COALESCE(os.accepts, 0)          AS accepts,
             os.prior_alpha, os.prior_beta,
-            ${kitHit}  AS kit_hit,
-            ${compHit} AS comp_hit,
+            ${kitHit}     AS kit_hit,
+            ${overlapHit} AS overlap_hit,
+            ${compHit}    AS comp_hit,
             bo.n_orders AS brand_orders,
             ao.n_orders AS anchor_orders,
             ${cfgCols.map((c) => `bc.${c} AS cfg_${c}`).join(',\n            ')}
@@ -244,16 +259,21 @@ async function runDecision(db, opts) {
   // As três continuam válidas; nenhuma é removida. Antes, `threshold` era aceito
   // e silenciosamente ignorado — o contrato de §5.1 do plano dos temas entregava
   // a feature morta sem erro. Achado batendo na API, não lendo o plano.
+  //
+  // O arredondamento não é cosmético: 64,90 − 34,90 = 30.000000000000007 em
+  // ponto flutuante, que é MAIOR que o `gap_hard_max` de 30 e desligava a faixa
+  // dura. Dois carrinhos vizinhos reportavam o mesmo `context.gap` e se
+  // comportavam de formas diferentes, sem nada no log explicando por quê.
   let gap = 0;
   let thresholdLabel = null;
   if (gapIn != null) {
-    gap = Number(gapIn) || 0;
+    gap = round2(Number(gapIn) || 0);
     if (threshold && threshold.label) thresholdLabel = String(threshold.label);
   } else if (threshold && threshold.value != null) {
-    gap = Math.max(0, Number(threshold.value) - cartTotal);
+    gap = round2(Math.max(0, Number(threshold.value) - cartTotal));
     thresholdLabel = threshold.label ? String(threshold.label) : null;
   } else if (cfg.free_shipping_threshold) {
-    gap = Math.max(0, cfg.free_shipping_threshold - cartTotal);
+    gap = round2(Math.max(0, cfg.free_shipping_threshold - cartTotal));
   }
 
   const bySku = new Map(products.map((p) => [p.sku, p]));
@@ -261,25 +281,45 @@ async function runDecision(db, opts) {
   const brandOrders = first?.brand_orders || 0;
   const anchorOrders = first?.anchor_orders || 0;
 
-  // kit_hit  — este candidato é kit e contém um SKU do carrinho (RT01008 → KRT99078)
-  // comp_hit — este candidato compõe um kit que já está no carrinho
+  // kit_hit     — candidato é kit e contém um SKU solto do carrinho (RT01008 → KRT99078)
+  // overlap_hit — candidato é kit e divide componente com um KIT do carrinho
+  // comp_hit    — candidato compõe um kit que já está no carrinho
   const kitComponentsOf = new Map();
   const cartKitComponents = new Set();
   for (const p of products) {
     if (p.kit_hit) kitComponentsOf.set(p.sku, new Set([p.kit_hit]));
+    else if (p.overlap_hit) {
+      kitComponentsOf.set(p.sku, new Set([p.overlap_hit]));
+      cartKitComponents.add(p.overlap_hit);
+    }
     if (p.comp_hit) cartKitComponents.add(p.sku);
   }
 
-  // equivalência funcional dos brindes (P6, heurística linha+subcategoria)
+  // equivalência funcional dos brindes (P6, heurística linha+subcategoria).
+  // `functionalKey` devolve null para quem não tem grupo funcional — e null
+  // NÃO entra no conjunto, senão a classe sem taxonomia volta a se auto-rejeitar.
   const giftKeys = new Set();
   for (const g of giftSkus) {
     const gp = bySku.get(g);
-    if (gp) giftKeys.add(functionalKey(gp));
+    const k = gp && functionalKey(gp);
+    if (k) giftKeys.add(k);
   }
+
+  // A regra de afinidade vale contra o carrinho inteiro, não só a âncora: é o
+  // que impede a punição de substituto de valer só para o item mais caro.
+  const cartProds = cartList.map((sku) => bySku.get(sku)).filter(Boolean);
+  const collectible = parseCollectible(cfg.collectible_categories);
+  const lineLabels = parseLineLabels(cfg.line_labels);
+
+  // Semente do Thompson Sampling por (marca, oferta, superfície, goal, segmento,
+  // janela de 15 min). Mesmo carrinho, mesma oferta, dentro da janela.
+  const win = tsWindow();
+  const rndFor = (sku) => rngFrom(hashSeed(`${brand}|${sku}|${surface}|${goal}|${segment}|${win}`));
 
   const ctx = {
     cfg, cartSkus, giftSkus, giftKeys, cartTotal, kitComponentsOf,
     cartKitComponents, gap, thresholdLabel, goal, priceTarget, maxDiscount, anchorProd,
+    cartProds, collectible, lineLabels, rndFor,
     affinityOf: (sku) => {
       const p = bySku.get(sku);
       return { co: p?.co || 0, anchorOrders, candOrders: p?.cand_orders || 0, brandOrders };
@@ -332,6 +372,21 @@ async function runDecision(db, opts) {
 }
 
 function stripDebug(o) { const { _debug, ...rest } = o; return rest; }
+
+/** `line_labels` da config: JSON {linha: rótulo público} com a chave normalizada. */
+function parseLineLabels(raw) {
+  if (!raw) return null;
+  try {
+    const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!obj || typeof obj !== 'object') return null;
+    const out = {};
+    for (const [k, v] of Object.entries(obj)) {
+      const nk = normTax(k);
+      if (nk && v) out[nk] = String(v);
+    }
+    return Object.keys(out).length ? out : null;
+  } catch { return null; }
+}
 
 function rejectSummary(rejected) {
   const by = {};
@@ -482,11 +537,13 @@ async function handleSetConfig(request, db) {
   const body = await readJson(request);
   const brand = normBrand(body.brand);
   if (!brand) return json({ error: 'brand_required' }, 400);
-  const cols = ['margin_floor', 'max_discount', 'allow_percent_discount', 'free_shipping_threshold',
-    'gap_hard_max', 'price_cap_ratio', 'marginal_shipping', 'tax_rate',
-    'prior_alpha', 'prior_beta', 'slow_moving_days', 'dead_coverage_days'];
+  const cols = Object.keys(DEFAULT_CONFIG);
   const current = (await db.all('SELECT * FROM brand_config WHERE brand = ?', [brand]))[0] || {};
-  const vals = cols.map((c) => (body[c] !== undefined ? body[c] : (current[c] ?? null)));
+  // `line_labels` chega como objeto JSON; a coluna é TEXT e o driver só liga escalares.
+  const vals = cols.map((c) => {
+    const v = body[c] !== undefined ? body[c] : (current[c] ?? null);
+    return v !== null && typeof v === 'object' ? JSON.stringify(v) : v;
+  });
   await db.run(
     `INSERT OR REPLACE INTO brand_config (brand, ${cols.join(', ')}, updated_at)
      VALUES (?, ${cols.map(() => '?').join(', ')}, ?)`,

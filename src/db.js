@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS brand_config (
   free_shipping_threshold REAL, gap_hard_max REAL, price_cap_ratio REAL,
   marginal_shipping REAL, tax_rate REAL,
   prior_alpha REAL, prior_beta REAL, slow_moving_days REAL, dead_coverage_days REAL,
+  min_price REAL, gap_hard_max_ratio REAL, stock_urgency_enabled INTEGER,
+  low_stock_units REAL, collectible_categories TEXT, line_labels TEXT,
   updated_at TEXT
 );
 `;
@@ -135,6 +137,12 @@ export function toObjects(r) {
  */
 export const MIGRATIONS = [
   'ALTER TABLE brand_config ADD COLUMN dead_coverage_days REAL',
+  'ALTER TABLE brand_config ADD COLUMN min_price REAL',
+  'ALTER TABLE brand_config ADD COLUMN gap_hard_max_ratio REAL',
+  'ALTER TABLE brand_config ADD COLUMN stock_urgency_enabled INTEGER',
+  'ALTER TABLE brand_config ADD COLUMN low_stock_units REAL',
+  'ALTER TABLE brand_config ADD COLUMN collectible_categories TEXT',
+  'ALTER TABLE brand_config ADD COLUMN line_labels TEXT',
 ];
 
 async function runMigrations(db) {

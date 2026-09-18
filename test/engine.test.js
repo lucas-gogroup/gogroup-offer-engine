@@ -2,8 +2,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  hardFilterReject, inGapBand, decide, mergeConfig, affinityScore,
+  hardFilterReject, inGapBand, gapAtivo, decide, mergeConfig, affinityScore,
   marginPostIncentive, priceRoom, stockUrgency, sampleBeta, DEFAULT_CONFIG,
+  ruleAffinity, ruleAffinityOverCart, parseCollectible, normTax, functionalKey,
+  fitPreco, buildCopy, hashSeed, rngFrom, scoreOf,
 } from '../src/engine.js';
 
 const cfg = mergeConfig(null);
@@ -134,17 +136,30 @@ test('sem cogs, sem variant_id ou sem preço o SKU não entra', () => {
 // Gap de threshold
 // ---------------------------------------------------------------------------
 
-test('faixa [gap, 3×gap]', () => {
+test('faixa [gap, 3×gap] com o topo grampeado no teto de preço', () => {
   assert.equal(inGapBand(30, 30), true);
   assert.equal(inGapBand(90, 30), true);
   assert.equal(inGapBand(91, 30), false);
   assert.equal(inGapBand(29, 30), false);
   assert.equal(inGapBand(50, 0), false);
+
+  // §2.11: sem o grampo, a faixa pede um preço que o teto de 60% proíbe, os
+  // dois se anulam e o carrinho fica sem oferta com benefício.
+  assert.equal(inGapBand(90, 30, 100, 0.6), false, '3×gap=90 > 60% de 100');
+  assert.equal(inGapBand(55, 30, 100, 0.6), true);
+});
+
+test('gap ativo é min(40, 30% do carrinho), não um valor fixo', () => {
+  // Um gap de R$ 30 num carrinho de R$ 35 não é "quase lá": é 86% do carrinho.
+  assert.equal(gapAtivo(30, 35, cfg), false);
+  assert.equal(gapAtivo(30, 200, cfg), true);
+  assert.equal(gapAtivo(45, 1000, cfg), false, 'o teto absoluto de 40 continua valendo');
+  assert.equal(gapAtivo(0, 200, cfg), false);
 });
 
 test('gap pequeno vira filtro duro; relaxa e registra se esvaziar o pool', () => {
   const inBand = prod({ sku: 'IN', price: 25, cogs: 6 });
-  const outBand = prod({ sku: 'OUT', price: 5, cogs: 1 });
+  const outBand = prod({ sku: 'OUT', price: 60, cogs: 15 });
   const r1 = decide([inBand, outBand], ctx({ gap: 10, cartTotal: 200 }));
   assert.deepEqual(r1.offers.map((o) => o.sku), ['IN']);
   assert.deepEqual(r1.relaxed, []);
@@ -203,10 +218,13 @@ test('com allow_percent_discount ligado, o desconto respeita o piso', () => {
 // ---------------------------------------------------------------------------
 
 test('afinidade cai para a regra quando não há co-compra', () => {
-  const a = prod({ line: 'essenciais' });
-  const b = prod({ line: 'essenciais' });
-  assert.equal(affinityScore({ co: 0 }, a, b), 1.0);
-  assert.equal(affinityScore({ co: 0 }, a, prod({ line: 'outra', subcategory: 'z', category: 'w' })), 0.2);
+  const a = prod({ line: 'essenciais', subcategory: 'magnesio' });
+  // Mesma subcategoria é SUBSTITUTO: quem levou 4Mag não quer outro magnésio.
+  assert.equal(affinityScore({ co: 0 }, a, prod({ subcategory: 'magnesio' })), 0.10);
+  // Mesma linha, subcategoria diferente: 0,35.
+  assert.equal(affinityScore({ co: 0 }, a, prod({ subcategory: 'colageno' })), 0.35);
+  // Sem relação nenhuma: 0,20.
+  assert.equal(affinityScore({ co: 0 }, a, prod({ line: 'outra', subcategory: 'z', category: 'w' })), 0.20);
 });
 
 test('co-compra forte sobe a afinidade acima da regra fraca', () => {
@@ -232,9 +250,11 @@ test('urgência de estoque: rampa entre o limiar do handoff e o estoque morto', 
 });
 
 test('goal muda a ordem do ranking sobre o mesmo pool', () => {
-  const afim = prod({ sku: 'AFIM', line: 'essenciais', price: 40, cogs: 12, coverage_days: 10 });
+  // AFIM é complemento: mesma linha da âncora, subcategoria DIFERENTE (0,35).
+  // Mesma subcategoria seria substituto (0,10) — e era isso que o motor premiava.
+  const afim = prod({ sku: 'AFIM', line: 'essenciais', subcategory: 'colageno', price: 40, cogs: 12, coverage_days: 10 });
   const parado = prod({ sku: 'PARADO', line: 'outra', subcategory: 'z', category: 'w', price: 40, cogs: 5, coverage_days: 400 });
-  const anchorProd = prod({ sku: 'ANCHOR', line: 'essenciais' });
+  const anchorProd = prod({ sku: 'ANCHOR', line: 'essenciais', subcategory: 'magnesio' });
 
   const aov = decide([afim, parado], ctx({ goal: 'aov', anchorProd, cartTotal: 500 }));
   const stock = decide([afim, parado], ctx({ goal: 'stock', anchorProd, cartTotal: 500 }));
@@ -251,4 +271,189 @@ test('sampleBeta fica em [0,1] e segue o prior', () => {
   }
   const mean = sum / 4000;
   assert.ok(Math.abs(mean - 0.1) < 0.02, `média ${mean} deveria ficar perto de 0,10`);
+});
+
+// ---------------------------------------------------------------------------
+// Afinidade — tabela §2.8 e o que a auditoria não tinha medido
+// ---------------------------------------------------------------------------
+
+test('taxonomia normaliza antes de comparar: BODY SPLASH é Body Splash', () => {
+  // Medido no seed: 26 SKUs gravados 'BODY SPLASH' e 20 gravados 'Body Splash'.
+  // Com `===` cru, metade das canibalizações escapava da punição de substituto.
+  const a = prod({ subcategory: 'BODY SPLASH', line: 'TROPICAL GLOW' });
+  const b = prod({ subcategory: 'Body Splash', line: 'Tropical Glow' });
+  assert.equal(ruleAffinity(a, b), 0.10, 'mesmo produto, grafia diferente, ainda é substituto');
+  assert.equal(normTax('CÁPSULA'), normTax('Capsula'));
+  assert.equal(normTax('  PÓ '), 'po');
+});
+
+test('"Não se aplica" é ausência de linha, não uma linha em comum', () => {
+  const a = prod({ line: 'Não se aplica', subcategory: '' });
+  const b = prod({ line: 'não se aplica', subcategory: '' });
+  assert.equal(ruleAffinity(a, b), 0.20, 'dois produtos sem classificação não são da mesma linha');
+  assert.equal(normTax('Não se aplica'), '');
+});
+
+test('colecionável muda substituto (0,10) em variedade (0,40)', () => {
+  const coll = parseCollectible('Fragrances, Fragrancias');
+  const a = prod({ subcategory: 'Body Splash', category: 'FRAGRANCES' });
+  const b = prod({ subcategory: 'BODY SPLASH', category: 'Fragrancias' });
+  assert.equal(ruleAffinity(a, b), 0.10, 'sem a marca declarar, é substituto');
+  assert.equal(ruleAffinity(a, b, coll), 0.40, 'perfumaria: levar outra fragrância é compra real');
+  assert.equal(ruleAffinity(a, b, coll) < 1.0, true, 'mas nunca volta ao 1,00 que canibalizava');
+});
+
+test('a regra vale contra o carrinho inteiro, e substituto manda', () => {
+  const anchor = prod({ sku: 'A', line: 'essenciais', subcategory: 'colageno' });
+  const segundo = prod({ sku: 'B', line: 'outra', subcategory: 'magnesio' });
+  const cand = prod({ sku: 'C', line: 'essenciais', subcategory: 'magnesio' });
+
+  // Só contra a âncora, este candidato seria complemento de linha (0,35).
+  assert.equal(ruleAffinity(anchor, cand), 0.35);
+  // Contra o carrinho, ele canibaliza o SEGUNDO item — e é isso que vale.
+  assert.equal(ruleAffinityOverCart([anchor, segundo], cand), 0.10);
+
+  // Sem substituto no carrinho, o melhor vínculo ganha.
+  const neutro = prod({ sku: 'D', line: 'nenhuma', subcategory: 'zzz' });
+  assert.equal(ruleAffinityOverCart([neutro, anchor], cand), 0.35);
+});
+
+test('carrinho de um item continua idêntico ao comportamento por âncora', () => {
+  const anchor = prod({ line: 'essenciais', subcategory: 'colageno' });
+  const cand = prod({ line: 'essenciais', subcategory: 'magnesio' });
+  assert.equal(ruleAffinityOverCart([anchor], cand), ruleAffinity(anchor, cand));
+});
+
+// ---------------------------------------------------------------------------
+// Filtros novos
+// ---------------------------------------------------------------------------
+
+test('kit que divide componente com o kit do carrinho é barrado', () => {
+  // `cartSkus` com um kit dentro contém só o SKU do kit: comparar contra ele
+  // deixa passar o kit vizinho que entrega metade do que o cliente já comprou.
+  const c = ctx({
+    cartSkus: new Set(['KRT99046']),
+    cartKitComponents: new Set(['RT01003', 'RT01005']),
+    kitComponentsOf: new Map([['KRT99049', new Set(['RT01005', 'RT02001'])]]),
+    cartTotal: 569,
+  });
+  const r = hardFilterReject(prod({ sku: 'KRT99049', price: 300, cogs: 90, is_kit: 1 }), c);
+  assert.equal(r.code, 'kit_overlaps_cart_kit');
+  assert.equal(r.detail, 'KRT99049⊃RT01005', 'o log tem que dizer QUAL componente');
+});
+
+test('price_target é teto alternativo, não interruptor do teto', () => {
+  const cand = prod({ price: 40, cogs: 10 });
+  // R$ 1 de price_target liberava o catálogo inteiro; agora é max(teto, alvo).
+  assert.equal(hardFilterReject(cand, ctx({ goal: 'margin', priceTarget: 1, cartTotal: 49.8 })).code, 'over_price_cap');
+  assert.equal(hardFilterReject(cand, ctx({ goal: 'margin', priceTarget: 120, cartTotal: 49.8 })), null);
+  assert.equal(hardFilterReject(cand, ctx({ goal: 'aov', priceTarget: 999, cartTotal: 49.8 })).code, 'over_price_cap',
+    'fora do goal=margin o alvo não vale');
+});
+
+test('piso de preço: abaixo dele não é oferta', () => {
+  assert.equal(hardFilterReject(prod({ price: 14.9, cogs: 3 }), ctx()).code, 'below_min_price');
+  assert.equal(hardFilterReject(prod({ price: 0.02, cogs: 2 }), ctx()).code, 'below_min_price');
+  assert.equal(hardFilterReject(prod({ price: 15, cogs: 3 }), ctx()), null);
+});
+
+test('produto sem linha e sem subcategoria não equivale a nada', () => {
+  // A chave "|" fazia um único brinde rejeitar 44 dos 96 SKUs da Rituária.
+  assert.equal(functionalKey(prod({ line: '', subcategory: '' })), null);
+  assert.equal(functionalKey(prod({ line: 'A', subcategory: '' })), 'a|');
+  const c = ctx({ giftKeys: new Set(['|']) });
+  assert.equal(hardFilterReject(prod({ line: '', subcategory: '' }), c), null);
+});
+
+test('equivalente funcional continua barrando quando HÁ grupo, e diz qual', () => {
+  const c = ctx({ giftKeys: new Set(['essenciais|magnesio']) });
+  const r = hardFilterReject(prod({ line: 'ESSENCIAIS', subcategory: 'Magnesio' }), c);
+  assert.equal(r.code, 'gift_functional_equivalent');
+  assert.equal(r.detail, 'essenciais|magnesio');
+});
+
+// ---------------------------------------------------------------------------
+// Score
+// ---------------------------------------------------------------------------
+
+test('fit_preco põe o preço no score, que antes era cego abaixo do teto', () => {
+  assert.equal(fitPreco(30, 100), 1.0);
+  assert.equal(fitPreco(50, 100), 0.8);
+  assert.equal(fitPreco(10, 100), 0.7, 'barato demais para o carrinho também desconta');
+  assert.equal(fitPreco(50, 0), 1, 'sem carrinho o fator é neutro');
+});
+
+test('custo provisório penaliza o ranking, não o piso de margem', () => {
+  const real = prod({ sku: 'REAL', price: 50, cogs: 15 });
+  const prov = prod({ sku: 'PROV', price: 50, cogs: 15, cost_provisional: 1 });
+  const { offers } = decide([real, prov], ctx({ cartTotal: 200 }));
+  assert.equal(offers[0].sku, 'REAL', 'igual em tudo menos na confiança do custo');
+  assert.equal(offers.length, 2, 'o provisório continua ofertável — só deixa de ser preferido');
+});
+
+test('goal=margin passa a mover a margem na direção certa', () => {
+  const gordo = prod({ sku: 'GORDO', price: 60, cogs: 10, line: 'x', subcategory: 'x1' });
+  const magro = prod({ sku: 'MAGRO', price: 60, cogs: 35, line: 'x', subcategory: 'x1' });
+  const { offers } = decide([gordo, magro], ctx({ goal: 'margin', cartTotal: 200 }));
+  assert.equal(offers[0].sku, 'GORDO');
+});
+
+test('urgência de estoque tem chave mestra, e ela cobre o atalho de `dead`', () => {
+  const off = mergeConfig({ stock_urgency_enabled: 0 });
+  // Empurrar slow_moving_days para 100000 NÃO cobriria este caso:
+  assert.equal(stockUrgency(prod({ stock_status: 'dead' }), mergeConfig({ slow_moving_days: 100000 })), 2.0);
+  assert.equal(stockUrgency(prod({ stock_status: 'dead' }), off), 1.0);
+  assert.equal(stockUrgency(prod({ coverage_days: 90000 }), off), 1.0);
+});
+
+// ---------------------------------------------------------------------------
+// Copy
+// ---------------------------------------------------------------------------
+
+test('copy de linha só sai com rótulo público — nada de INSPIRADOS na tela', () => {
+  const anchorProd = prod({ line: 'INSPIRADOS' });
+  const cand = prod({ title: 'Body Splash Ocean', line: 'INSPIRADOS' });
+  const base = { anchorProd, gap: 0, incentive: { type: 'none' }, urgency: 1, cfg };
+
+  assert.match(buildCopy(cand, base), /Quem levou esse também levou/, 'sem rótulo, cai no genérico');
+  assert.equal(
+    buildCopy(cand, { ...base, lineLabels: { inspirados: 'Inspirados' } }),
+    'Completa sua rotina Inspirados: Body Splash Ocean',
+  );
+});
+
+test('"Últimas unidades" exige estoque de fato baixo', () => {
+  const base = { anchorProd: null, gap: 0, incentive: { type: 'none' }, urgency: 2.0, cfg };
+  // O Boné marcado como `dead` tem 4.170 unidades.
+  assert.match(buildCopy(prod({ title: 'Boné', available: 4170 }), base), /Quem levou esse/);
+  assert.match(buildCopy(prod({ title: 'Sérum', available: 12 }), base), /^Últimas unidades/);
+});
+
+test('reason não fala de cobertura quando não há cobertura', () => {
+  const { offers } = decide(
+    [prod({ sku: 'D', stock_status: 'dead', coverage_days: null, available: 4170 })],
+    ctx({ cartTotal: 200 }),
+  );
+  assert.equal(offers[0].stock_urgency, 2.0);
+  assert.ok(!/dias de cobertura/.test(offers[0].reason), `reason vazou cobertura: ${offers[0].reason}`);
+});
+
+// ---------------------------------------------------------------------------
+// Thompson Sampling estável na janela
+// ---------------------------------------------------------------------------
+
+test('mesma chave e mesma janela devolvem o mesmo sorteio', () => {
+  const key = 'rituaria|RT02015|cart|aov|new|1758200000';
+  const a = sampleBeta(2, 18, rngFrom(hashSeed(key)));
+  const b = sampleBeta(2, 18, rngFrom(hashSeed(key)));
+  assert.equal(a, b, 'recarregar o carrinho não pode mudar a oferta');
+
+  const outro = sampleBeta(2, 18, rngFrom(hashSeed('rituaria|RT02015|cart|aov|new|1758200001')));
+  assert.notEqual(a, outro, 'entre janelas o bandit continua explorando');
+});
+
+test('o RNG semeado continua sendo um Beta honesto', () => {
+  let sum = 0;
+  for (let i = 0; i < 4000; i++) sum += sampleBeta(2, 18, rngFrom(hashSeed(`k${i}`)));
+  assert.ok(Math.abs(sum / 4000 - 0.1) < 0.02, `média ${sum / 4000} deveria ficar perto de 0,10`);
 });

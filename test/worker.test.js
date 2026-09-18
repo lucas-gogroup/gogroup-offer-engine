@@ -574,3 +574,117 @@ test('reset SEM brand apaga tudo — é o footgun, e está coberto', async () =>
   assert.equal(r.body.brand, 'all');
   assert.equal(r.body.remaining, 0, 'sem brand, leva as duas marcas junto');
 });
+
+// ---------------------------------------------------------------------------
+// Ponta a ponta dos patches do plano de melhoria
+// ---------------------------------------------------------------------------
+
+test('PORTÃO 2 — kit no carrinho não oferta o kit vizinho que divide componente', async () => {
+  const env = newEnv();
+  await seed(env);
+  // KRT99079 divide RT01015 com o KRT99078 que já está no carrinho.
+  await call(env, 'POST', '/curate/product', {
+    rows: [{ brand: 'rituaria', sku: 'KRT99079', variant_id: '900009', title: 'Dupla Essencial',
+      price: 119.90, cogs: 36, available: 40, is_kit: 1, line: 'essenciais',
+      subcategory: 'kit', category: 'kit', coverage_days: 30 }],
+  }, true);
+  await call(env, 'POST', '/curate/kits', {
+    rows: [
+      { brand: 'rituaria', kit_sku: 'KRT99079', component_sku: 'RT01015', qty_per_kit: 1 },
+      { brand: 'rituaria', kit_sku: 'KRT99079', component_sku: 'RT02001', qty_per_kit: 1 },
+    ],
+  }, true);
+
+  const { body } = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria',
+    cart: [{ sku: 'KRT99078', qty: 1, price: 149.90 }],
+    cart_total: 900, // alto de propósito: o teto de preço NÃO pode ser o que protege
+    debug: true, n: 5,
+  });
+  const byCode = Object.fromEntries(body.rejected.map((r) => [r.sku, r.code]));
+  assert.equal(byCode.KRT99079, 'kit_overlaps_cart_kit');
+  const detail = body.rejected.find((r) => r.sku === 'KRT99079').detail;
+  assert.equal(detail, 'KRT99079⊃RT01015');
+  assert.ok(!body.offers?.some?.((o) => o.sku === 'KRT99079'));
+});
+
+test('gap de ponto flutuante: 64,90 − 34,90 não pode virar 30.000000000000007', async () => {
+  const env = newEnv();
+  await seed(env);
+  const r = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', cart_total: 34.90,
+    threshold: { value: 64.90, label: 'Frete Grátis' },
+    debug: true,
+  });
+  assert.equal(r.body.context.gap, 30, 'o gap reportado e o gap usado têm que ser o mesmo número');
+});
+
+test('mesmo carrinho, mesma janela: a loja não muda de ideia sozinha', async () => {
+  const env = newEnv();
+  await seed(env);
+  const body = {
+    brand: 'rituaria', cart: [{ sku: 'RT01008', qty: 1, price: 89.90 }],
+    cart_total: 300, n: 3,
+  };
+  const a = await call(env, 'POST', '/recommend', body);
+  const b = await call(env, 'POST', '/recommend', body);
+  assert.equal(a.body.sku, b.body.sku, 'duas impressões do mesmo carrinho são UM experimento');
+  assert.equal(a.body.take_rate_sampled, b.body.take_rate_sampled);
+});
+
+test('oferta abaixo do piso de preço não sai, e o log diz por quê', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/product', {
+    rows: [{ brand: 'rituaria', sku: 'RT99001', variant_id: '900099', title: 'Brinde Sachê',
+      price: 0.02, cogs: 0.005, available: 16415, line: '', subcategory: '',
+      category: 'Brindes', coverage_days: 900 }],
+  }, true);
+  const { body } = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', cart: [{ sku: 'RT01008', qty: 1, price: 89.90 }],
+    cart_total: 719.20, debug: true, n: 10,
+  });
+  const rej = body.rejected.find((r) => r.sku === 'RT99001');
+  assert.equal(rej.code, 'below_min_price');
+  assert.ok(!(body.offers || []).some((o) => o.price < 15));
+});
+
+test('config aceita os campos novos, inclusive o mapa de rótulos', async () => {
+  const env = newEnv();
+  await seed(env);
+  const set = await call(env, 'POST', '/config', {
+    brand: 'barbours',
+    stock_urgency_enabled: 0,
+    collectible_categories: 'Fragrances, Fragrancias',
+    line_labels: { 'tropical glow': 'Tropical Glow' },
+    min_price: 15,
+  }, true);
+  assert.equal(set.status, 200);
+  assert.equal(set.body.effective.stock_urgency_enabled, 0);
+  assert.equal(set.body.effective.collectible_categories, 'Fragrances, Fragrancias');
+
+  const got = await call(env, 'GET', '/config?brand=barbours');
+  assert.equal(got.body.effective.stock_urgency_enabled, 0);
+  assert.equal(JSON.parse(got.body.effective.line_labels)['tropical glow'], 'Tropical Glow');
+});
+
+test('a config da marca realmente desliga a urgência no /recommend', async () => {
+  const env = newEnv();
+  await call(env, 'POST', '/curate/product', {
+    rows: [
+      { brand: 'rituaria', sku: 'RT01008', variant_id: '1', title: 'Âncora', price: 89.90,
+        cogs: 22, available: 340, line: 'essenciais', subcategory: 'magnesio', coverage_days: 45 },
+      { brand: 'rituaria', sku: 'RT99003', variant_id: '2', title: 'Boné', price: 70,
+        cogs: 20, available: 4170, stock_status: 'dead', line: 'brindes', subcategory: 'bone' },
+    ],
+  }, true);
+  const req = { brand: 'rituaria', cart: [{ sku: 'RT01008', qty: 1, price: 89.90 }], cart_total: 300 };
+
+  const antes = await call(env, 'POST', '/recommend', req);
+  assert.equal(antes.body.stock_urgency, 2.0, 'o atalho de `dead` ignora a cobertura');
+
+  await call(env, 'POST', '/config', { brand: 'rituaria', stock_urgency_enabled: 0 }, true);
+  const depois = await call(env, 'POST', '/recommend', req);
+  assert.equal(depois.body.stock_urgency, 1.0);
+  assert.ok(!/Últimas unidades/.test(depois.body.copy));
+});
