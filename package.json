@@ -1,0 +1,11 @@
+{
+  "name": "go-offer-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Motor de oferta inteligente: /recommend devolve a oferta certa por carrinho, com filtros duros, score deterministico e bandit.",
+  "main": "src/worker.js",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}
