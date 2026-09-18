@@ -343,12 +343,56 @@ test('kit que divide componente com o kit do carrinho é barrado', () => {
 });
 
 test('price_target é teto alternativo, não interruptor do teto', () => {
-  const cand = prod({ price: 40, cogs: 10 });
+  // Carrinho de R$ 49,80: teto = max(60% × 49,80 = 29,88 ; piso absoluto 60) = 60.
+  const cand = prod({ price: 90, cogs: 22 });
   // R$ 1 de price_target liberava o catálogo inteiro; agora é max(teto, alvo).
   assert.equal(hardFilterReject(cand, ctx({ goal: 'margin', priceTarget: 1, cartTotal: 49.8 })).code, 'over_price_cap');
   assert.equal(hardFilterReject(cand, ctx({ goal: 'margin', priceTarget: 120, cartTotal: 49.8 })), null);
   assert.equal(hardFilterReject(cand, ctx({ goal: 'aov', priceTarget: 999, cartTotal: 49.8 })).code, 'over_price_cap',
     'fora do goal=margin o alvo não vale');
+});
+
+test('piso absoluto do teto devolve o carrinho de entrada ao jogo', () => {
+  // O SKU mais barato da Rituária é R$ 40 e o carrinho de entrada é R$ 49,90:
+  // 60% dão R$ 29,94 e a marca inteira fica muda justamente na porta.
+  const barato = prod({ price: 40, cogs: 10 });
+  const semPiso = mergeConfig({ price_cap_abs: 0 });
+  assert.equal(hardFilterReject(barato, ctx({ cfg: semPiso, cartTotal: 49.9 })).code, 'over_price_cap');
+  assert.equal(hardFilterReject(barato, ctx({ cartTotal: 49.9 })), null, 'com o piso de R$ 60, entra');
+
+  // E o piso só morde embaixo: acima de R$ 100 de carrinho o proporcional já é
+  // maior que 60 e o piso vira inerte — quem manda volta a ser os 60%.
+  const caro = prod({ price: 170, cogs: 45 });
+  assert.equal(hardFilterReject(caro, ctx({ cartTotal: 300 })), null, '60% de 300 = 180');
+  assert.equal(hardFilterReject(caro, ctx({ cartTotal: 200 })).code, 'over_price_cap', '60% de 200 = 120');
+});
+
+test('quem fecha o benefício passa por cima do teto — e só até 1,5× o gap', () => {
+  // O caso real: carrinho de R$ 49,90, frete grátis em R$ 199, gap de R$ 149,10.
+  const c = (over) => ctx({ cartTotal: 49.9, gap: 149.1, thresholdLabel: 'Frete Grátis', ...over });
+  const fecha = prod({ sku: 'K149', price: 149.9, cogs: 45 });
+  assert.equal(hardFilterReject(fecha, c()), null, 'leva o carrinho a R$ 199,80');
+
+  // Passa longe demais: 569 > 1,5 × 149,10 = 223,65.
+  assert.equal(hardFilterReject(prod({ price: 569, cogs: 170 }), c()).code, 'over_price_cap');
+  // Não fecha o gap e não cabe no teto de R$ 60: continua fora.
+  assert.equal(hardFilterReject(prod({ price: 99, cogs: 30 }), c()).code, 'over_price_cap');
+
+  const { offers } = decide([fecha], c());
+  assert.equal(offers[0].incentive.type, 'threshold');
+  assert.equal(offers[0].closes_benefit, true);
+  assert.equal(offers[0].benefit_label, 'Frete Grátis');
+  assert.equal(offers[0].benefit_threshold, 199);
+  assert.equal(offers[0].cart_total_after, 199.8);
+  assert.match(offers[0].copy, /^Faltam R\$ 149,10 para Frete Grátis/);
+});
+
+test('oferta que não fecha o benefício não recebe a bandeira', () => {
+  const { offers } = decide([prod({ price: 50, cogs: 12 })], ctx({ cartTotal: 200, gap: 149.1 }));
+  assert.equal(offers[0].closes_benefit, false);
+  assert.equal(offers[0].benefit_label, null);
+  assert.equal(offers[0].benefit_threshold, null);
+  assert.equal(offers[0].incentive.type, 'none');
 });
 
 test('piso de preço: abaixo dele não é oferta', () => {
@@ -456,4 +500,14 @@ test('o RNG semeado continua sendo um Beta honesto', () => {
   let sum = 0;
   for (let i = 0; i < 4000; i++) sum += sampleBeta(2, 18, rngFrom(hashSeed(`k${i}`)));
   assert.ok(Math.abs(sum / 4000 - 0.1) < 0.02, `média ${sum / 4000} deveria ficar perto de 0,10`);
+});
+
+test('o piso absoluto não vira licença em carrinho minúsculo', () => {
+  // Carrinho de R$ 14,90 (existe: 3 SKUs da Barbour's). Sem a trava de uplift,
+  // o piso de R$ 60 liberaria uma oferta 4× maior que o carrinho.
+  const c = ctx({ cartTotal: 14.9, gap: 0 });
+  assert.equal(hardFilterReject(prod({ price: 59.9, cogs: 15 }), c).code, 'over_price_cap');
+  assert.equal(hardFilterReject(prod({ price: 19.9, cogs: 5 }), c), null, '1,5 × 14,90 = 22,35');
+  // E o carrinho de entrada de R$ 49,90 continua recebendo: 1,5 × 49,90 > 60.
+  assert.equal(hardFilterReject(prod({ price: 59.9, cogs: 15 }), ctx({ cartTotal: 49.9 })), null);
 });

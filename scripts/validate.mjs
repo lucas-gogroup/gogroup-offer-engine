@@ -87,8 +87,14 @@ for (const brand of ['barbours', 'rituaria']) {
   // O teto é por marca e ajustável em runtime: cravar 0,6 aqui faria o
   // checklist acusar a própria config da Rituária como violação.
   const cfg = (await get(`/config?brand=${brand}`)).effective || {};
-  const teto = cfg.price_cap_ratio ?? 0.6;
   const minPrice = cfg.min_price ?? 15;
+  // Mesma regra do motor: o teto é o maior entre a fração do carrinho e o piso
+  // absoluto, e o piso não pode passar de `uplift × carrinho`. Recalcular aqui
+  // com a fórmula antiga faria o checklist acusar a própria config como furo.
+  const tetoDe = (cart) => Math.max(
+    (cfg.price_cap_ratio ?? 0.6) * cart,
+    Math.min(cfg.price_cap_abs ?? 0, (cfg.price_cap_uplift_max ?? 1.5) * cart),
+  );
   const amostra = await get(`/offers?brand=${brand}&anchor=__none__&n=50`);
   const pool = amostra.offers || [];
   const skus = pool.map((o) => o.sku).slice(0, 25);
@@ -99,7 +105,14 @@ for (const brand of ['barbours', 'rituaria']) {
     const cartTotal = prod.price;
     for (const o of r.offers || []) {
       emitidas++;
-      if (o.price > teto * cartTotal + 1e-9) { furaTeto++; furos.push(`teto: ${brand}/${sku} → ${o.sku} R$${o.price} (carrinho R$${cartTotal}, teto ${teto})`); }
+      const teto = tetoDe(cartTotal);
+      // A varredura roda sem gap, então nenhuma oferta pode invocar a dispensa
+      // de quem fecha o benefício: aqui o teto vale liso.
+      if (o.closes_benefit) { furos.push(`inesperado: ${o.sku} diz fechar benefício sem gap`); furaTeto++; }
+      else if (o.price > teto + 1e-9) { furaTeto++; furos.push(`teto: ${brand}/${sku} → ${o.sku} R$${o.price} (carrinho R$${cartTotal}, teto R$${teto.toFixed(2)})`); }
+      if (o.price > (cfg.price_cap_uplift_max ?? 1.5) * cartTotal + 1e-9 && !o.closes_benefit) {
+        furos.push(`uplift: ${brand}/${sku} → ${o.sku} R$${o.price} em carrinho R$${cartTotal}`); furaTeto++;
+      }
       if (o.price < minPrice) { furaMinPrice++; furos.push(`piso de preço: ${brand}/${o.sku} R$${o.price}`); }
       if (/^Últimas unidades/.test(o.copy || '')) { escassezFalsa++; furos.push(`escassez: ${o.sku} available=${o.available}`); }
       if (/INSPIRADOS|CAPSULA|Não se aplica/i.test(o.copy || '')) { jargao++; furos.push(`jargão no copy: ${o.copy}`); }

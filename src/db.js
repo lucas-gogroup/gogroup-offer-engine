@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS brand_config (
   marginal_shipping REAL, tax_rate REAL,
   prior_alpha REAL, prior_beta REAL, slow_moving_days REAL, dead_coverage_days REAL,
   min_price REAL, gap_hard_max_ratio REAL, stock_urgency_enabled INTEGER,
+  price_cap_abs REAL, gap_overshoot_max REAL, price_cap_uplift_max REAL,
   low_stock_units REAL, collectible_categories TEXT, line_labels TEXT,
   updated_at TEXT
 );
@@ -143,6 +144,9 @@ export const MIGRATIONS = [
   'ALTER TABLE brand_config ADD COLUMN low_stock_units REAL',
   'ALTER TABLE brand_config ADD COLUMN collectible_categories TEXT',
   'ALTER TABLE brand_config ADD COLUMN line_labels TEXT',
+  'ALTER TABLE brand_config ADD COLUMN price_cap_abs REAL',
+  'ALTER TABLE brand_config ADD COLUMN gap_overshoot_max REAL',
+  'ALTER TABLE brand_config ADD COLUMN price_cap_uplift_max REAL',
 ];
 
 async function runMigrations(db) {
@@ -169,10 +173,55 @@ export function splitStatements(sql) {
 // não precisa rodar de novo. WeakMap por banco para os testes não vazarem entre si.
 const schemaDone = new WeakMap();
 
+/** Tabelas declaradas no DDL, lidas do próprio texto — não dá para desalinhar. */
+const SCHEMA_TABLES = [...SCHEMA.matchAll(/CREATE TABLE IF NOT EXISTS (\w+)/g)].map((m) => m[1]);
+
+/**
+ * Colunas esperadas em `brand_config`: as do DDL mais as que as migrações
+ * acrescentam. Derivado, porque um número cravado aqui envelheceria em silêncio
+ * e o motor voltaria a rodar o DDL inteiro a cada request sem ninguém notar.
+ */
+const CFG_COLS_ESPERADAS = (() => {
+  const bloco = SCHEMA.match(/CREATE TABLE IF NOT EXISTS brand_config \(([\s\S]*?)\n\);/);
+  const doDdl = bloco
+    ? bloco[1].split(',').map((c) => c.trim().split(/\s+/)[0]).filter(Boolean)
+    : [];
+  const deMigracao = MIGRATIONS
+    .map((m) => m.match(/ALTER TABLE brand_config ADD COLUMN (\w+)/))
+    .filter(Boolean).map((m) => m[1]);
+  return new Set([...doDdl, ...deMigracao]).size;
+})();
+
+/**
+ * O banco já está no formato atual?
+ *
+ * Uma pergunta, uma ida ao banco. Sem isto, TODA requisição pagava 9 CREATE
+ * TABLE, 2 CREATE INDEX e 9 ALTER TABLE — vinte idas ao `env.DB` a ~150 ms cada
+ * — sempre que o isolate fosse novo. Foi o que derrubou o app quando a lista de
+ * migrações cresceu de 1 para 9: o `/health`, que não decide nada, passou a dar
+ * timeout junto com o resto.
+ */
+async function schemaAtual(db) {
+  try {
+    const r = await db.all(
+      `SELECT (SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (${
+        SCHEMA_TABLES.map(() => '?').join(',')})) AS tabelas,
+              (SELECT COUNT(*) FROM pragma_table_info('brand_config')) AS colunas`,
+      SCHEMA_TABLES,
+    );
+    const row = r && r[0];
+    return !!row && Number(row.tabelas) >= SCHEMA_TABLES.length
+        && Number(row.colunas) >= CFG_COLS_ESPERADAS;
+  } catch {
+    return false; // banco novo, ou driver sem pragma: cai no caminho completo
+  }
+}
+
 export async function ensureSchema(db, key) {
   const k = key || db;
   if (schemaDone.has(k)) return schemaDone.get(k);
   const p = (async () => {
+    if (await schemaAtual(db)) return;
     for (const stmt of splitStatements(SCHEMA)) await db.run(stmt, []);
     await runMigrations(db);
   })().catch((e) => { schemaDone.delete(k); throw e; });

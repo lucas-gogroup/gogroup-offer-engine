@@ -47,11 +47,16 @@ O `label` é usado no copy: com `"Frete Grátis"` sai *"Leve X e ganhe Frete
 Grátis"*. Mandar `gap` **e** `threshold` juntos é o recomendado — o `gap` manda
 no número e o `label` no texto.
 
-> **`gap` maior que o teto de preço.** Carrinho de R$ 89,90 com frete grátis em
-> R$ 199 dá gap de R$ 109,10, e aí `incentive.type` volta `"none"`. Não é bug: a
-> oferta nunca passa de 60% do carrinho (R$ 53,94 aqui), e nada abaixo disso
-> fecha o gap. Ofertar R$ 109 num carrinho de R$ 90 é exatamente o erro que o
-> motor existe para não repetir. O `context.gap` continua preenchido.
+> **`gap` maior que o teto de preço — mudou.** O teto deixou de vetar quem fecha
+> o benefício. Carrinho de R$ 49,90 com frete grátis em R$ 199 dá gap de
+> R$ 149,10, e o motor **oferta** um item de R$ 149,90 a R$ 223,65 — a faixa que
+> leva o carrinho ao frete sem passar longe. Quem chega com o carrinho de
+> entrada é justamente quem tem o maior gap, e era quem nunca recebia nada.
+>
+> O limite continua existindo em dois lugares: a oferta não passa de
+> `gap_overshoot_max` × gap (1,5 por default), e fora do caso de benefício
+> vale o teto ordinário — `max(60% do carrinho, price_cap_abs)`, ele mesmo
+> limitado a `price_cap_uplift_max` × carrinho.
 
 ### Resposta
 
@@ -65,6 +70,10 @@ no número e o `label` no texto.
   "price": 49.90,
   "final_price": 49.90,
   "incentive": { "type": "none|threshold|percent", "value": 0, "label": "..." },
+  "closes_benefit": true,        // esta oferta leva o carrinho ao benefício
+  "benefit_label": "Frete Grátis",
+  "benefit_threshold": 199.00,   // o valor que passa a ser alcançado
+  "cart_total_after": 199.80,    // carrinho + esta oferta
   "expected_margin": 0.72,
   "stock_coverage_days": 62.7,
   "affinity_score": 0.40,
@@ -82,6 +91,20 @@ no número e o `label` no texto.
 **Sem oferta válida:** HTTP 200 com `offers: []` e `reason` explicando
 (ex.: `"sem oferta: over_price_cap=73, kit_contains_cart_sku=14"`).
 Nesse caso **esconda o bloco** — nunca renderize card vazio.
+
+### A bandeira de benefício
+
+Quando `closes_benefit` é `true`, **adicionar esta oferta garante o benefício** —
+`benefit_label` traz o nome dele e `cart_total_after` o total resultante. É o
+gancho para o selo no card ("Ganha Frete Grátis"), sem precisar interpretar o
+texto do `copy`.
+
+O `copy` nesse caso já vem com o número: *"Faltam R$ 149,10 para Frete Grátis —
+leve X e garanta"*. Se o tema quiser escrever o próprio texto, os quatro campos
+acima dão tudo: quanto falta (`context.gap`), o rótulo, o teto e o total final.
+
+`closes_benefit: false` com `incentive.type: "none"` é a oferta comum, sem
+promessa — renderize sem selo.
 
 ### Cabe ao tema
 
@@ -161,6 +184,9 @@ Pisos e tetos por marca, **em runtime, sem redeploy**.
 |---|---|---|
 | `margin_floor` | 0.30 | piso de margem pós-incentivo |
 | `price_cap_ratio` | 0.6 | teto da oferta sobre o carrinho |
+| `price_cap_abs` | 60 | **piso absoluto do teto** — sem ele, 60% de R$ 49,90 é R$ 29,94 e a Rituária fica muda no carrinho de entrada |
+| `price_cap_uplift_max` | 1.5 | trava do piso: ele nunca eleva o teto acima disso × carrinho |
+| `gap_overshoot_max` | 1.5 | quanto quem fecha o benefício pode passar do gap |
 | `max_discount` | 0.15 | teto do degrau 4 |
 | `allow_percent_discount` | 0 | **desligado**: o checkout Yampi não aplica % |
 | `free_shipping_threshold` | null | usado se o tema não mandar gap/threshold |

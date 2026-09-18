@@ -195,7 +195,11 @@ test('toda chamada grava contexto, decisão e motivo no decision_log', async () 
 test('grava no log até quando não há oferta, com o motivo', async () => {
   const env = newEnv();
   await seed(env);
-  // carrinho de R$ 10: nada cabe no teto de 60%
+  // Carrinho de R$ 10 com o piso absoluto do teto zerado para esta marca: aí
+  // vale só o proporcional (R$ 6) e nada do catálogo cabe. Com o piso de R$ 60
+  // — que é o default e existe para o carrinho de entrada — este carrinho
+  // receberia oferta, e é essa a intenção.
+  await call(env, 'POST', '/config', { brand: 'rituaria', price_cap_abs: 0 }, true);
   const r = await call(env, 'POST', '/recommend', {
     brand: 'rituaria', cart: [{ sku: 'RT01008', qty: 1, price: 10 }],
   });
@@ -687,4 +691,28 @@ test('a config da marca realmente desliga a urgência no /recommend', async () =
   const depois = await call(env, 'POST', '/recommend', req);
   assert.equal(depois.body.stock_urgency, 1.0);
   assert.ok(!/Últimas unidades/.test(depois.body.copy));
+});
+
+test('banco já no formato atual não paga o DDL de novo', async () => {
+  // O DDL custa 20 idas ao env.DB (~150 ms cada no GoDeploy). Se o isolate for
+  // novo a cada request, isso é o request inteiro — foi o que derrubou o app
+  // quando a lista de migrações cresceu. Uma pergunta basta para saber.
+  const raw = new DatabaseSync(':memory:');
+  let escritas = 0;
+  const espiao = {
+    prepare(sql) {
+      if (!/^\s*SELECT/i.test(sql)) escritas++;
+      return raw.prepare(sql);
+    },
+  };
+  const { ensureSchema, adaptDb } = await import('../src/db.js');
+  const db = adaptDb(espiao);
+
+  await ensureSchema(db, { primeira: true });
+  const custoDoZero = escritas;
+  assert.ok(custoDoZero > 15, `banco vazio tem que criar tudo (foram ${custoDoZero})`);
+
+  escritas = 0;
+  await ensureSchema(db, { segunda: true }); // chave nova: força reavaliar
+  assert.equal(escritas, 0, 'banco já atual: nenhuma escrita de DDL');
 });

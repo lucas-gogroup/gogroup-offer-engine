@@ -15,6 +15,21 @@ export const DEFAULT_CONFIG = {
   gap_hard_max: 40,              // §2.11: gap ativo até min(40, ratio × carrinho)
   gap_hard_max_ratio: 0.30,
   price_cap_ratio: 0.6,          // teto de preço da oferta sobre o carrinho
+  // Piso ABSOLUTO do teto. Um teto só proporcional colapsa no carrinho de
+  // entrada: 60% de R$ 49,90 é R$ 29,94, abaixo do SKU mais barato da Rituária
+  // (R$ 40), e a marca inteira fica muda justamente onde mais precisa de
+  // empurrão. Só morde em carrinho pequeno — em R$ 300 o proporcional já ganha.
+  price_cap_abs: 60,
+  // ...mas o piso não pode virar licença: num carrinho de R$ 14,90 ele liberaria
+  // uma oferta de R$ 59,90, que é 4× o carrinho sem benefício nenhum atrelado —
+  // o erro original que o teto existe para não repetir. Quem passa disso tem que
+  // ser quem fecha o benefício, e aí a justificativa é do próprio cliente.
+  price_cap_uplift_max: 1.5,
+  // Quanto a oferta que FECHA o benefício pode passar do gap. O teto não veta
+  // quem entrega o que o cliente já está perseguindo: com gap de R$ 149,10 e
+  // frete grátis em R$ 199, um item de R$ 149,90 leva o carrinho a R$ 199,80.
+  // O limite existe para não empurrar um kit de R$ 569 num carrinho de R$ 49,90.
+  gap_overshoot_max: 1.5,
   marginal_shipping: 0,          // R$/unidade — estimativa por marca (P5)
   tax_rate: 0.10,                // estimativa por marca (P5)
   prior_alpha: 0.98,             // take rate histórico de order bump × peso 10
@@ -104,18 +119,55 @@ export function hardFilterReject(cand, ctx) {
   // §3.1 — piso absoluto. Ofertar R$ 14,90 num carrinho de R$ 719 não é upsell.
   if (cand.price < cfg.min_price) return { code: 'below_min_price' };
 
-  // R4 — teto de 60% do carrinho. `price_target` é TETO ALTERNATIVO, não
-  // interruptor: antes bastava a presença do campo para desligar o teto, e um
-  // `price_target: 1` liberava o catálogo inteiro.
-  const baseCap = cfg.price_cap_ratio * ctx.cartTotal;
-  const cap = (ctx.goal === 'margin' && ctx.priceTarget > 0)
-    ? Math.max(baseCap, ctx.priceTarget)
-    : baseCap;
-  if (ctx.cartTotal > 0 && cand.price > cap) {
-    return { code: 'over_price_cap' };
+  // R4 — teto de preço, com duas saídas.
+  //
+  // O teto existe para não ofertar R$ 109 num carrinho de R$ 90. Só que puramente
+  // proporcional ele vira mudez: quem chega com um item de R$ 49,90 é exatamente
+  // quem tem o maior gap para o frete grátis, e nunca recebia oferta nenhuma.
+  //
+  // Saída 1: piso absoluto, que devolve o carrinho de entrada ao jogo.
+  // Saída 2: quem FECHA o benefício passa por cima do teto. Não é exceção
+  //          arbitrária — é o objetivo declarado do próprio cliente.
+  if (ctx.cartTotal > 0 && cand.price > priceCap(ctx, cfg)
+      && !capExemptByBenefit(cand.price, ctx.gap, cfg)) {
+    return { code: 'over_price_cap', detail: `${cand.price}>${round2(priceCap(ctx, cfg))}` };
   }
 
   return null;
+}
+
+/** Teto ordinário: o maior entre a fração do carrinho e o piso absoluto. */
+export function priceCap(ctx, cfg) {
+  const piso = Math.min(cfg.price_cap_abs || 0,
+    (cfg.price_cap_uplift_max ?? 1.5) * ctx.cartTotal);
+  const base = Math.max(cfg.price_cap_ratio * ctx.cartTotal, piso);
+  // `price_target` é teto ALTERNATIVO, não interruptor: antes bastava a presença
+  // do campo para desligar o teto, e um `price_target: 1` liberava o catálogo.
+  return (ctx.goal === 'margin' && ctx.priceTarget > 0)
+    ? Math.max(base, ctx.priceTarget)
+    : base;
+}
+
+/**
+ * A oferta leva o carrinho ao benefício. Fato, sem juízo de valor: se o cliente
+ * adiciona este item, ele ganha o frete. É o que manda no rótulo, no copy, na
+ * bandeira para o tema e no bônus de ranking.
+ */
+export function closesBenefit(price, gap) {
+  return gap > 0 && price >= gap;
+}
+
+/**
+ * ...e o teto perdoa quem fecha o benefício SEM passar longe demais.
+ *
+ * Separado de propósito do predicado acima. Um gap de R$ 10 fechado por um item
+ * de R$ 25 continua dando frete grátis e merece o rótulo — só não precisa de
+ * perdão nenhum, porque passa no teto normal. O perdão é para o caso do
+ * carrinho de entrada, em que fechar o benefício custa mais que o teto permite;
+ * e o limite existe para não empurrar um kit de R$ 569 num carrinho de R$ 49,90.
+ */
+export function capExemptByBenefit(price, gap, cfg) {
+  return closesBenefit(price, gap) && price <= gap * (cfg.gap_overshoot_max ?? 1.5);
 }
 
 /**
@@ -360,7 +412,8 @@ export function incentiveLadder(cand, ctx) {
   // Degrau 2 — a própria oferta fecha o gap do benefício: incentivo sem custo.
   // O rótulo vem do tema (`threshold.label`), porque o benefício nem sempre é
   // frete grátis — pode ser 3x sem juros ou brinde por faixa.
-  if (gap > 0 && cand.price >= gap) {
+  //
+  if (closesBenefit(cand.price, gap)) {
     const label = ctx.thresholdLabel || 'frete grátis';
     return {
       incentive: { type: 'threshold', value: 0, label },
@@ -404,7 +457,12 @@ export function incentiveLadder(cand, ctx) {
 export function buildCopy(cand, { anchorProd, gap, incentive, urgency, cfg, lineLabels }) {
   const title = cand.title || cand.sku;
   if (incentive.type === 'threshold') {
-    return `Leve ${title} e ganhe ${incentive.label || 'frete grátis'}`;
+    const label = incentive.label || 'frete grátis';
+    // Dizer quanto falta é o que torna a oferta uma resposta, e não um anúncio:
+    // o shopper vê o número da barra de progresso e o item que o zera.
+    return gap > 0
+      ? `Faltam R$ ${gap.toFixed(2).replace('.', ',')} para ${label} — leve ${title} e garanta`
+      : `Leve ${title} e ganhe ${label}`;
   }
   if (incentive.type === 'percent') {
     return `${title} com ${incentive.value}% off só agora`;
@@ -526,7 +584,8 @@ export function decide(candidates, ctx) {
 
   // 2) faixa de gap como filtro duro — relaxa se esvaziar o pool, e registra
   if (gapAtivo(ctx.gap, ctx.cartTotal, cfg)) {
-    const banded = pool.filter((c) => inGapBand(c.price, ctx.gap, ctx.cartTotal, cfg.price_cap_ratio));
+    const banded = pool.filter((c) => inGapBand(c.price, ctx.gap, ctx.cartTotal, cfg.price_cap_ratio)
+      || capExemptByBenefit(c.price, ctx.gap, cfg));
     if (banded.length) pool = banded;
     else relaxed.push('gap_band');
   }
@@ -553,8 +612,9 @@ export function decide(candidates, ctx) {
       (stats.prior_beta ?? cfg.prior_beta) + Math.max(0, stats.impressions - stats.accepts),
       (ctx.rndFor && ctx.rndFor(cand.sku)) || ctx.rnd,
     );
-    const inBand = inGapBand(cand.price, ctx.gap, ctx.cartTotal, cfg.price_cap_ratio);
-    const gapBonus = inBand ? GAP_BONUS : 1;
+    const fecha = closesBenefit(cand.price, ctx.gap);
+    const inBand = fecha || inGapBand(cand.price, ctx.gap, ctx.cartTotal, cfg.price_cap_ratio);
+    const gapBonus = fecha ? GAP_BONUS : 1;
     const fit = fitPreco(cand.price, ctx.cartTotal);
     // §2.7: o piso de margem já foi cobrado acima sobre a margem REAL.
     const marginScore = cand.cost_provisional ? margin * PROVISIONAL_COST_PENALTY : margin;
@@ -572,6 +632,13 @@ export function decide(candidates, ctx) {
       incentive: ladder.incentive,
       final_price: round2(ladder.final_price),
       incentive_step: ladder.step,
+      // Bandeira estruturada para o tema: quem fecha o benefício merece
+      // tratamento visual próprio, e ler isso de um booleano é mais confiável
+      // que procurar o texto do copy.
+      closes_benefit: fecha,
+      benefit_label: fecha ? (ctx.thresholdLabel || 'frete grátis') : null,
+      benefit_threshold: fecha ? round2(ctx.cartTotal + ctx.gap) : null,
+      cart_total_after: round2(ctx.cartTotal + cand.price),
       expected_margin: round4(margin),
       stock_coverage_days: cand.coverage_days ?? null,
       available: cand.available,
