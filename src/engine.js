@@ -834,6 +834,20 @@ export function assembleSlots(scored, bySlot, rejectedBySku, slots) {
     }
   }
 
+  // Vaga pedida além do que o carrinho renderiza. Vindo de `decide` isso não
+  // acontece — `resolvePins` já descarta —, mas um `bySlot` montado à mão é
+  // ponto de entrada declarado, e o laço acima simplesmente nunca visitaria a
+  // regra: ela sumiria sem nenhuma linha no relatório.
+  for (const [s, r] of bySlot) {
+    if (s > n) {
+      pins.push({
+        slot_pedido: s, offer_sku: String(r.offer_sku), pin_rule: pinKey(r),
+        trigger_type: r.trigger_type, slot: null, applied: false,
+        fallback_reason: 'slot_fora_do_alcance',
+      });
+    }
+  }
+
   const resto = scored.filter((o) => !usados.has(o.sku));
   const offers = [];
   const infoPorIndice = new Map();

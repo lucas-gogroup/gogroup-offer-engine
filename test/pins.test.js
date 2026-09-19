@@ -704,3 +704,14 @@ test('empate com mesmo updated_at ainda tem ordem total', () => {
   assert.equal(resolvePins([a, b], base).bySlot.get(1).offer_sku, 'A');
   assert.equal(resolvePins([b, a], base).bySlot.get(1).offer_sku, 'A');
 });
+
+test('assembleSlots relata a vaga além do alcance em vez de engolir a regra', () => {
+  const scored = [{ sku: 'A' }, { sku: 'B' }];
+  const bySlot = new Map([[5, { slot: 5, trigger_type: 'always', trigger_key: '', offer_sku: 'A' }]]);
+  const { offers, pins } = assembleSlots(scored, bySlot, new Map(), 3);
+  assert.equal(pins.length, 1, 'a regra não pode sumir sem linha no relatório');
+  assert.equal(pins[0].applied, false);
+  assert.equal(pins[0].fallback_reason, 'slot_fora_do_alcance');
+  assert.equal(pins[0].slot_pedido, 5);
+  assert.ok(!offers.some((o) => o.pinned));
+});

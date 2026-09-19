@@ -320,8 +320,10 @@ removeu enquanto a regra segue decidindo o carrinho. É POST porque o CORS do ap
 só libera `GET, POST, OPTIONS`.
 
 `POST /curate/pins` (bearer) — carga em lote, no formato dos outros `/curate`.
-Diferente do `POST /pins`, aqui é **substituição total** da linha, como nas
-outras tabelas de carga: campo que não vier volta ao default. Erros saem por
+Diferente do `POST /pins`, aqui é **substituição total** da linha: campo que não
+vier volta ao default. A exceção é `created_at`, preservado no re-push — não é
+campo que alguém digita, e carimbá-lo a cada "salvar tudo" apagaria o instante
+real de criação de todas as regras. Erros saem por
 linha em `errors[]` sem derrubar o lote. E
 `POST /curate/reset?table=pins&brand=` zera antes de recarregar.
 
@@ -330,6 +332,11 @@ linha em `errors[]` sem derrubar o lote. E
 que não reconhece, em vez de assumir "pausada" em silêncio.
 
 ### Por que uma regra não apareceu
+
+Regra **pausada não viaja no `/recommend`**: campanha desligada não decide nada,
+e o carrinho não pode carregar a cada request toda regra que a marca já
+aposentou. O simulador recebe todas, porque é lá que "por que minha regra não
+apareceu?" é a pergunta.
 
 `GET /offers` devolve sempre `pins_discarded`, com o motivo de cada regra que
 existe e não agiu, em ordem de precedência da checagem: `slot_invalido`,

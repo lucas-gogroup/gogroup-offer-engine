@@ -1418,8 +1418,10 @@ test('priority não numérico é recusado, não virado em zero', async () => {
 test('debug no /recommend só vale com bearer', async () => {
   const env = newEnv();
   await seed(env);
+  // Ativa, mas com gatilho que não casa: regra pausada não viaja no /recommend,
+  // então o motivo dela é assunto do simulador, não do carrinho.
   await call(env, 'POST', '/curate/pins', {
-    rows: [pinRow({ slot: 1, offer_sku: 'RT02001', active: 0 })],
+    rows: [pinRow({ slot: 1, trigger_type: 'sku', trigger_sku: 'RT01008', offer_sku: 'RT02001' })],
   }, true);
 
   const corpo = {
@@ -1438,8 +1440,28 @@ test('debug no /recommend só vale com bearer', async () => {
 
   const comToken = await call(env, 'POST', '/recommend', corpo, true);
   assert.ok(Array.isArray(comToken.body.rejected));
-  assert.ok(comToken.body.pins_discarded.some((d) => d.why === 'pausada'));
+  assert.ok(comToken.body.pins_discarded.some((d) => d.why === 'gatilho_nao_casou'));
   assert.ok(comToken.body.timings);
+});
+
+test('regra pausada não viaja no carrinho, mas o simulador a explica', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [pinRow({ slot: 1, offer_sku: 'RT02001', active: 0 })],
+  }, true);
+
+  // Campanha desligada não decide nada, e o carrinho não pode carregar para
+  // sempre, a cada request, toda regra que a marca já aposentou.
+  const carrinho = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', n: 3, cart_total: 89.90, debug: true,
+    cart: [{ sku: 'RT01008', qty: 1, price: 89.90 }],
+  }, true);
+  assert.deepEqual(carrinho.body.pins_discarded, undefined);
+
+  // No simulador, "por que minha regra não apareceu?" é a pergunta central.
+  const sim = await call(env, 'GET', '/offers?brand=rituaria&anchor=RT01008&n=3', undefined, true);
+  assert.ok(sim.body.pins_discarded.some((d) => d.why === 'pausada'));
 });
 
 test('planilha em pt-BR carrega VERDADEIRO e FALSO, não só metade', async () => {
@@ -1619,4 +1641,65 @@ test('carrinho gigante no /recommend não estoura o limite de binds', async () =
   });
   assert.equal(status, 200, 'não pode virar 500 com stack');
   assert.ok(body.offer_id);
+});
+
+test('re-push do painel não apaga o created_at das regras', async () => {
+  const env = newEnv();
+  await seed(env);
+  const lote = { rows: [pinRow({ slot: 1, offer_sku: 'RT02001', note: 'v1' })] };
+
+  await call(env, 'POST', '/curate/pins', lote, true);
+  const antes = (await call(env, 'GET', '/pins?brand=rituaria', undefined, true)).body.rules[0];
+
+  await new Promise((r) => setTimeout(r, 5));
+  await call(env, 'POST', '/curate/pins', { rows: [pinRow({ slot: 1, offer_sku: 'RT02001', note: 'v2' })] }, true);
+  const depois = (await call(env, 'GET', '/pins?brand=rituaria', undefined, true)).body.rules[0];
+
+  // `created_at` não é campo que o operador digita: o "salvar tudo" do painel
+  // carimbava "agora" nele e apagava o instante real de criação.
+  assert.equal(depois.created_at, antes.created_at);
+  assert.equal(depois.note, 'v2', 'o resto atualiza normalmente');
+  assert.notEqual(depois.updated_at, antes.updated_at);
+});
+
+test('regra de outra superfície não dispara alarme falso de duplicidade', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/pins',
+    { brand: 'rituaria', slot: 1, trigger_type: 'always', surface: 'cart', offer_sku: 'RT02001' }, true);
+
+  // As duas nunca competem: `resolvePins` descarta a fora de escopo antes da
+  // desduplicação por produto. Avisar aqui convidaria a apagar uma regra boa.
+  const pdp = await call(env, 'POST', '/pins',
+    { brand: 'rituaria', slot: 2, trigger_type: 'always', surface: 'pdp', offer_sku: 'RT02001' }, true);
+  assert.deepEqual(pdp.body.warnings, []);
+
+  // Já no mesmo escopo, o aviso tem que sair.
+  const mesmo = await call(env, 'POST', '/pins',
+    { brand: 'rituaria', slot: 3, trigger_type: 'always', surface: 'cart', offer_sku: 'RT02001' }, true);
+  assert.equal(mesmo.body.warnings.length, 1);
+  assert.match(mesmo.body.warnings[0], /nunca vai aparecer/);
+});
+
+test('/pins lista a regra vigente antes da pausada mais específica', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [
+      // mais específica, porém pausada: não pode encabeçar a lista
+      pinRow({ slot: 1, trigger_type: 'sku', trigger_sku: 'RT01008', offer_sku: 'RT02001', active: 0 }),
+      pinRow({ slot: 1, trigger_type: 'always', offer_sku: 'RT01015' }),
+    ],
+  }, true);
+
+  const { body } = await call(env, 'GET', '/pins?brand=rituaria&slot=1', undefined, true);
+  assert.equal(body.rules[0].offer_sku, 'RT01015', 'a doc promete que a primeira é a que venceria');
+  assert.equal(body.rules[0].effective, true);
+  assert.equal(body.rules[1].effective, false);
+
+  const rec = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', n: 3, cart_total: 89.90,
+    cart: [{ sku: 'RT01008', qty: 1, price: 89.90 }],
+  });
+  assert.equal(rec.body.offers[0].sku, 'RT01015', 'e é mesmo a que o motor aplica');
 });

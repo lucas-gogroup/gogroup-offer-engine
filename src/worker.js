@@ -265,10 +265,14 @@ async function runDecision(db, opts) {
   // afinidade voltar zerada em silêncio, sem erro de SQL.
   //
   // É por isso que as regras de curadoria vêm por um LEFT JOIN agregado com
-  // ZERO parâmetro, correlacionado por `pr.brand = p.brand`. Um `?` de data ou
-  // de `active` ali entraria no meio dessa ordem e zeraria a afinidade sem
-  // avisar — e a validade é regra de negócio, que pertence ao engine, testável
-  // sem banco. O filtro no SQL é só por marca; o resto `resolvePins` resolve.
+  // ZERO parâmetro, correlacionado por `pr.brand = p.brand`. Um `?` de DATA ali
+  // entraria no meio dessa ordem e zeraria a afinidade sem avisar — e validade
+  // é regra de negócio, que pertence ao engine, testável sem banco.
+  //
+  // `active = 1` é literal, não tem bind e não mexe na ordem, então esse fica no
+  // SQL: regra pausada não decide nada e o carrinho não pode carregar, a cada
+  // request e para sempre, toda campanha que a marca já desligou. O simulador
+  // pede `pinsAll` e recebe tudo, porque lá o motivo "pausada" é a resposta.
   // Agregar por marca (em vez de subquery correlacionada na cláusula SELECT)
   // também evita reavaliar o group_concat nas 241 linhas do catálogo.
   const prodParams = [];
@@ -317,7 +321,7 @@ async function runDecision(db, opts) {
                   COALESCE(ends_at, '')      || char(31) ||
                   priority     || char(31) ||
                   COALESCE(updated_at, ''), char(30)) AS wire
-           FROM pin_rule GROUP BY brand
+           FROM pin_rule ${opts.pinsAll ? '' : 'WHERE active = 1'} GROUP BY brand
        ) pr ON pr.brand = p.brand
       WHERE p.brand = ?`,
     prodParams,
@@ -602,6 +606,9 @@ async function handleOffers(url, db) {
     agent: 'simulacao',
     anchor,
     noPins: q.get('no_pins') === '1',
+    // O simulador vê as pausadas também: "por que minha regra não apareceu?" é
+    // a pergunta que ele existe para responder.
+    pinsAll: true,
   });
 
   return json({
@@ -862,12 +869,26 @@ const SPECS = {
     },
   },
 
-  // Curadoria em lote (o "salvar tudo" do painel). `replace` sobre a chave
-  // natural torna o re-push idempotente de graça.
+  // Curadoria em lote (o "salvar tudo" do painel).
+  //
+  // Upsert em vez de replace por causa de UMA coluna: `created_at` não é campo
+  // que o operador digita, e com `INSERT OR REPLACE` todo re-push do painel
+  // carimbava "agora" nele, apagando o instante real de criação de todas as
+  // regras. O conflito atualiza tudo menos ele.
   pins: {
     physical: 'pin_rule',
-    mode: 'replace',
+    mode: 'upsert',
     cols: PIN_COLS,
+    conflict: `ON CONFLICT (brand, slot, trigger_type, trigger_key, surface, goal) DO UPDATE SET
+       offer_sku = excluded.offer_sku,
+       trigger_field = excluded.trigger_field,
+       trigger_value = excluded.trigger_value,
+       priority = excluded.priority,
+       active = excluded.active,
+       starts_at = excluded.starts_at,
+       ends_at = excluded.ends_at,
+       note = excluded.note,
+       updated_at = excluded.updated_at`,
     map: (r, ctx) => pinTuple({ ...r, brand: r.brand ?? ctx.meta.brand }, ctx.now),
   },
 };
@@ -1094,20 +1115,30 @@ async function handleListPins(url, db) {
     params,
   );
 
+  const now = new Date().toISOString();
+  const vigente = (r) => Number(r.active) === 1
+    && !(r.ends_at && String(r.ends_at) < now)
+    && !(r.starts_at && String(r.starts_at) > now);
+
   // A ordem dentro da vaga é a da DISPUTA, e vem do próprio comparador do
   // engine — reescrevê-la em SQL criaria uma segunda versão da precedência que
   // divergiria. Ordenar por `priority DESC` aqui, por exemplo, mostrava um
   // `always` de prioridade 99 acima do `sku` que realmente vence, ensinando ao
   // operador exatamente o modelo mental errado.
+  //
+  // Quem não está vigente vai para o fim: `comparePins` só compara
+  // especificidade, e `resolvePins` filtra validade ANTES de ordenar. Sem isto,
+  // uma regra pausada e mais específica aparecia em primeiro enquanto o motor
+  // aplicava outra — e a doc promete que "a primeira é a que venceria".
   rows.sort((a, b) => (
     String(a.brand).localeCompare(String(b.brand))
     || a.slot - b.slot
+    || (vigente(b) ? 1 : 0) - (vigente(a) ? 1 : 0)
     || comparePins(a, b)
   ));
 
   // O estado calculado vai junto: sem ele o painel teria que reimplementar a
   // regra de validade em JavaScript e as duas versões divergiriam.
-  const now = new Date().toISOString();
   return json({
     count: rows.length,
     now,
@@ -1261,12 +1292,19 @@ async function handleSetPin(request, db) {
   // `offer_sku`, então qualquer regra de qualquer gatilho numa vaga menor
   // apontando para o mesmo produto anula esta — e avisar só quando o gatilho
   // também coincide deixava passar em silêncio o caso mais comum.
-  const gemeas = await db.all(
-    `SELECT slot, trigger_type FROM pin_rule
+  const candidatas = await db.all(
+    `SELECT slot, trigger_type, surface, goal FROM pin_rule
       WHERE brand=? AND offer_sku=? AND slot<>? AND active=1
       ORDER BY slot`,
     [row.brand, row.offer_sku, row.slot],
   );
+  // Só disputam de verdade quem pode estar no ar no MESMO request. Sem o
+  // recorte de escopo, uma regra de PDP acusava uma de carrinho de nunca ir
+  // aparecer — um alarme falso que convida a apagar uma regra que funciona.
+  const cruza = (a, b) => a === '*' || b === '*' || a === b;
+  const gemeas = Number(row.active) === 1
+    ? candidatas.filter((g) => cruza(g.surface, row.surface) && cruza(g.goal, row.goal))
+    : [];
   const menores = gemeas.filter((g) => g.slot < row.slot);
   if (menores.length) {
     warnings.push(`${row.offer_sku} já está fixado na vaga ${menores.map((g) => g.slot).join(', ')}; a vaga menor vence e esta regra nunca vai aparecer`);
