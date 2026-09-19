@@ -1754,7 +1754,7 @@ test('/pins filtra por escopo na leitura', async () => {
   assert.equal(so.body.rules[0].offer_sku, 'RT02001');
 });
 
-test('/pins devolve o desempenho do braço |pin da regra', async () => {
+test('/pins devolve o desempenho do produto fixado, e diz que é do produto', async () => {
   const env = newEnv();
   await seed(env);
   await call(env, 'POST', '/curate/pins', {
@@ -1771,10 +1771,15 @@ test('/pins devolve o desempenho do braço |pin da regra', async () => {
   // O braço era só escrita: nenhuma rota o lia, e "defender ou matar uma regra
   // com número" não era alcançável pela API.
   const { body } = await call(env, 'GET', '/pins?brand=rituaria', undefined, true);
-  assert.equal(body.rules[0].performance.impressions, 1);
-  assert.equal(body.rules[0].performance.accepts, 1);
-  assert.equal(body.rules[0].performance.take_rate, null, 'amostra insuficiente não vira taxa');
-  assert.equal(body.rules[0].performance.conclusive, false);
+  const perf = body.rules[0].pinned_product_performance;
+  assert.equal(perf.impressions, 1);
+  assert.equal(perf.accepts, 1);
+  assert.equal(perf.take_rate, null, 'amostra insuficiente não vira taxa');
+  assert.equal(perf.conclusive, false);
+  // O nome importa: offer_stats não tem vaga nem gatilho, então isto é do
+  // PRODUTO fixado. Chamar de "desempenho da regra" daria uma precisão que o
+  // dado não tem.
+  assert.match(perf.scope, /produto fixado/);
 });
 
 test('o stack de um 500 só sai com bearer', async () => {
@@ -1793,4 +1798,156 @@ test('o stack de um 500 só sai com bearer', async () => {
     brand: 'rituaria', cart: [{ sku: 'X', qty: 1, price: 1 }], cart_total: 1,
   }, true);
   assert.ok(comToken.body.stack);
+});
+
+// ---------------------------------------------------------------------------
+// Retenção do decision_log
+//
+// É a única tabela que cresce sem teto: uma linha por chamada de /recommend,
+// /offers e /event, ~690 bytes cada. Sem poda, cinco marcas no ar enchem o
+// env.DB — e a escrita fica lenta antes de falhar, no caminho do shopper.
+// ---------------------------------------------------------------------------
+
+import { pruneDecisionLog } from '../src/worker.js';
+import { adaptDb } from '../src/db.js';
+
+/** Semeia o log direto, com idade controlada. */
+function seedLog(env, n, diasAtras, prefixo) {
+  const ts = new Date(Date.now() - diasAtras * 86400_000).toISOString();
+  for (let i = 0; i < n; i++) {
+    env.DB.prepare(
+      `INSERT INTO decision_log (offer_id, ts, brand, agent, context_json, decision_json, reason)
+       VALUES (?, ?, 'rituaria', 'ofertante', '{}', '{}', 'teste')`,
+    ).run(`${prefixo}${i}`, ts);
+  }
+}
+
+async function comSchema() {
+  const env = newEnv();
+  await call(env, 'GET', '/health');   // cria o schema
+  return env;
+}
+
+const contaLog = (env) => env.DB.prepare('SELECT COUNT(*) AS n FROM decision_log').get().n;
+
+test('poda apaga o que passou da janela e preserva o que está dentro', async () => {
+  const env = await comSchema();
+  const antes = contaLog(env);
+  seedLog(env, 30, 40, 'velho-');
+  seedLog(env, 12, 1, 'novo-');
+
+  const r = await pruneDecisionLog(adaptDb(env.DB), { keep_days: 7 });
+
+  assert.equal(r.deleted_by_age, 30, 'as 30 linhas de 40 dias têm que sair');
+  assert.equal(contaLog(env), antes + 12, 'as 12 de ontem têm que ficar');
+});
+
+test('a janela protege o /event: oferta recente ainda resolve depois da poda', async () => {
+  const env = await comSchema();
+  await call(env, 'POST', '/curate/product', { rows: PRODUCTS }, true);
+  const rec = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', cart: [{ sku: 'RT01008', qty: 1, price: 89.90 }],
+  });
+  seedLog(env, 20, 90, 'antigo-');
+
+  await pruneDecisionLog(adaptDb(env.DB), { keep_days: 7 });
+
+  const ev = await call(env, 'POST', '/event', { offer_id: rec.body.offer_id, event: 'impression' });
+  assert.equal(ev.status, 200, 'a oferta de agora não pode ter sido podada');
+});
+
+test('a válvula max_rows corta mesmo dentro da janela', async () => {
+  const env = await comSchema();
+  seedLog(env, 50, 0, 'hoje-');
+  const alvo = contaLog(env) - 20;
+
+  const r = await pruneDecisionLog(adaptDb(env.DB), { keep_days: 7, max_rows: alvo, batch: 1000 });
+
+  assert.equal(r.deleted_by_age, 0, 'nada estava fora da janela');
+  assert.equal(r.deleted_by_cap, 20, 'a válvula corta o excedente');
+  assert.equal(contaLog(env), alvo);
+});
+
+test('a poda é limitada por lote — não varre a tabela inteira de uma vez', async () => {
+  const env = await comSchema();
+  const antes = contaLog(env);
+  seedLog(env, 40, 30, 'velho-');
+
+  const r = await pruneDecisionLog(adaptDb(env.DB), { keep_days: 7, batch: 10, max_batches: 2 });
+
+  assert.equal(r.deleted_by_age, 20, 'dois lotes de dez, e para');
+  assert.equal(contaLog(env), antes + 20, 'o resto fica para a próxima passada');
+  assert.equal(r.truncated, true, 'e a resposta avisa que sobrou');
+});
+
+test('a carga poda junto e diz quanto podou', async () => {
+  const env = await comSchema();
+  seedLog(env, 15, 30, 'velho-');
+
+  const r = await call(env, 'POST', '/curate/product', { rows: PRODUCTS }, true);
+
+  assert.equal(r.status, 200);
+  assert.equal(r.body.pruned.deleted_by_age, 15, 'a carga diária paga a retenção');
+});
+
+test('/prune exige bearer', async () => {
+  const env = await comSchema();
+  assert.equal((await call(env, 'POST', '/prune', {})).status, 401);
+  assert.equal((await call(env, 'POST', '/prune', { keep_days: 7 }, true)).status, 200);
+});
+
+test('filtro por escopo inclui as regras curinga que também governam', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/pins',
+    { brand: 'rituaria', slot: 1, trigger_type: 'always', surface: '*', offer_sku: 'RT02001' }, true);
+  await call(env, 'POST', '/pins',
+    { brand: 'rituaria', slot: 2, trigger_type: 'always', surface: 'pdp', offer_sku: 'RT01015' }, true);
+
+  // `= ?` literal escondia justamente a regra que mais manda no carrinho.
+  const { body } = await call(env, 'GET', '/pins?brand=rituaria&surface=cart', undefined, true);
+  assert.equal(body.count, 1);
+  assert.equal(body.rules[0].offer_sku, 'RT02001');
+});
+
+test('com escopo pedido, a primeira da lista é mesmo a que o motor aplica', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [
+      pinRow({ slot: 1, surface: 'pdp', offer_sku: 'RT02001' }),
+      pinRow({ slot: 1, surface: '*', offer_sku: 'RT01015' }),
+    ],
+  }, true);
+
+  // Sem recorte, a de PDP vinha em primeiro por ser mais específica — mas ela
+  // nem disputa o carrinho, porque resolvePins filtra escopo antes.
+  const lista = await call(env, 'GET', '/pins?brand=rituaria&surface=cart', undefined, true);
+  assert.equal(lista.body.rules[0].offer_sku, 'RT01015');
+
+  const rec = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', surface: 'cart', n: 3, cart_total: 89.90,
+    cart: [{ sku: 'RT01008', qty: 1, price: 89.90 }],
+  });
+  assert.equal(rec.body.offers[0].sku, 'RT01015');
+});
+
+test('regra expirada não acusa a nova de nunca aparecer', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [pinRow({ slot: 1, offer_sku: 'RT02001', ends_at: '2020-01-01' })],
+  }, true);
+
+  // A expirada não disputa mais nada: avisar aqui é alarme falso que convida a
+  // apagar a regra nova, que funciona.
+  const nova = await call(env, 'POST', '/pins',
+    { brand: 'rituaria', slot: 2, trigger_type: 'always', offer_sku: 'RT02001' }, true);
+  assert.deepEqual(nova.body.warnings, []);
+
+  const rec = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', n: 3, cart_total: 89.90,
+    cart: [{ sku: 'RT01008', qty: 1, price: 89.90 }],
+  });
+  assert.ok(rec.body.offers.some((o) => o.sku === 'RT02001' && o.pinned));
 });

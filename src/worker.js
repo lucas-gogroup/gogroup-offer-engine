@@ -92,6 +92,8 @@ async function route(request, url, db, env) {
   if (p === '/pins' && m === 'GET') return guard(request, env, () => handleListPins(url, db));
   if (p === '/pins' && m === 'POST') return guard(request, env, () => handleSetPin(request, db));
   if (p === '/pins/delete' && m === 'POST') return guard(request, env, () => handleDeletePin(request, db));
+  // Retenção do decision_log. Fechada: apaga dado, e é o que a cron chama.
+  if (p === '/prune' && m === 'POST') return guard(request, env, () => handlePrune(request, url, db));
   if (p === '/curate/reset' && m === 'POST') return guard(request, env, () => handleReset(url, db));
   if (p.startsWith('/curate/') && m === 'POST') {
     const table = p.slice('/curate/'.length);
@@ -1110,9 +1112,17 @@ async function handleListPins(url, db) {
   // Escopo é filtro de leitura também: sem ele, `?slot=1` devolve a regra do
   // carrinho e a da PDP intercaladas, as duas com `effective: true`, e não há
   // como o painel saber qual governa o carrinho.
+  // `IN (?, '*')` e não `= ?`: uma regra curinga TAMBÉM governa o carrinho, e
+  // filtrar literalmente escondia justamente as que mais mandam. Com o recorte,
+  // a lista passa a ser exatamente quem disputa aquele escopo.
+  let comEscopo = false;
   for (const campo of ['surface', 'goal']) {
     const v = q.get(campo);
-    if (v != null && v !== '') { where.push(`r.${campo} = ?`); params.push(pinScope(v)); }
+    if (v != null && v !== '') {
+      where.push(`r.${campo} IN (?, '*')`);
+      params.push(pinScope(v));
+      comEscopo = true;
+    }
   }
   const activeQ = q.get('active');
   if (activeQ != null && activeQ !== '') {
@@ -1135,10 +1145,14 @@ async function handleListPins(url, db) {
             p.available AS offer_available,
             (SELECT SUM(impressions) FROM offer_stats os
               WHERE os.brand = r.brand AND os.offer_sku = r.offer_sku
-                AND os.segment LIKE '%|pin') AS pin_impressions,
+                AND os.segment LIKE '%|pin'
+                AND (r.surface = '*' OR os.surface = r.surface)
+                AND (r.goal = '*' OR os.goal = r.goal)) AS pin_impressions,
             (SELECT SUM(accepts) FROM offer_stats os
               WHERE os.brand = r.brand AND os.offer_sku = r.offer_sku
-                AND os.segment LIKE '%|pin') AS pin_accepts
+                AND os.segment LIKE '%|pin'
+                AND (r.surface = '*' OR os.surface = r.surface)
+                AND (r.goal = '*' OR os.goal = r.goal)) AS pin_accepts
        FROM pin_rule r
        LEFT JOIN product p ON p.brand = r.brand AND p.sku = r.offer_sku
       ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
@@ -1161,9 +1175,17 @@ async function handleListPins(url, db) {
   // especificidade, e `resolvePins` filtra validade ANTES de ordenar. Sem isto,
   // uma regra pausada e mais específica aparecia em primeiro enquanto o motor
   // aplicava outra — e a doc promete que "a primeira é a que venceria".
+  //
+  // Sem recorte de escopo a lista mistura regras que NUNCA disputam entre si —
+  // a de carrinho e a de PDP —, e aí "a primeira é a que venceria" não pode ser
+  // verdade para nenhuma das duas. Nesse caso as regras são agrupadas por
+  // escopo, e a ordem da disputa vale dentro de cada grupo. Com `?surface=` a
+  // pergunta fica bem-posta e a lista inteira responde a ela.
   rows.sort((a, b) => (
     String(a.brand).localeCompare(String(b.brand))
     || a.slot - b.slot
+    || (comEscopo ? 0 : String(a.surface).localeCompare(String(b.surface))
+                       || String(a.goal).localeCompare(String(b.goal)))
     || (vigente(b) ? 1 : 0) - (vigente(a) ? 1 : 0)
     || comparePins(a, b)
   ));
@@ -1180,14 +1202,21 @@ async function handleListPins(url, db) {
       const impressoes = Number(imp) || 0;
       return {
         ...regra,
+        // Do PRODUTO fixado, não da regra: `offer_stats` tem marca, âncora,
+        // superfície, goal e segmento — não tem vaga nem gatilho. Duas regras
+        // que fixam o mesmo SKU no mesmo escopo compartilham este número, e
+        // chamá-lo de "desempenho da regra" seria dar ao operador uma precisão
+        // que o dado não tem. O nome diz o que é.
+        //
         // Abaixo de 300 impressões a taxa mente, e é na cauda que ela aparece:
-        // devolver `take_rate: null` é mais honesto que um número que ninguém
-        // deveria usar para decidir.
-        performance: {
+        // `take_rate: null` é mais honesto que um número que ninguém deveria
+        // usar para decidir.
+        pinned_product_performance: {
           impressions: impressoes,
           accepts: Number(acc) || 0,
           take_rate: impressoes >= 300 ? (Number(acc) || 0) / impressoes : null,
           conclusive: impressoes >= 300,
+          scope: 'produto fixado nesta marca e escopo, somando todas as vagas',
         },
         expired: expirada,
         not_started: naoComecou,
@@ -1338,12 +1367,13 @@ async function handleSetPin(request, db) {
   // `offer_sku`, então qualquer regra de qualquer gatilho numa vaga menor
   // apontando para o mesmo produto anula esta — e avisar só quando o gatilho
   // também coincide deixava passar em silêncio o caso mais comum.
-  const candidatas = await db.all(
-    `SELECT slot, trigger_type, surface, goal FROM pin_rule
+  const candidatas = (await db.all(
+    `SELECT slot, trigger_type, surface, goal, starts_at, ends_at FROM pin_rule
       WHERE brand=? AND offer_sku=? AND slot<>? AND active=1
       ORDER BY slot`,
     [row.brand, row.offer_sku, row.slot],
-  );
+  )).filter((g) => !(g.ends_at && String(g.ends_at) < agora)
+                && !(g.starts_at && String(g.starts_at) > agora));
   // Só disputam de verdade quem pode estar no ar no MESMO request. Sem o
   // recorte de escopo, uma regra de PDP acusava uma de carrinho de nunca ir
   // aparecer — um alarme falso que convida a apagar uma regra que funciona.
@@ -1437,6 +1467,90 @@ async function handleDeletePin(request, db) {
   });
 }
 
+/**
+ * Retenção do `decision_log` — o único crescimento sem teto do app.
+ *
+ * Toda chamada de /recommend, /offers e /event grava uma linha de ~690 bytes
+ * (medido em 19/09, 25 linhas amostradas). Não havia poda nenhuma: com as cinco
+ * marcas no ar isso é da ordem de 0,7 GB por milhão de chamadas, para sempre.
+ * O env.DB não avisa quando aperta — a escrita fica lenta antes de falhar, e a
+ * escrita está no caminho do shopper.
+ *
+ * Duas travas, de propósito diferentes:
+ *
+ *   `keep_days`  a de rotina. Tem de sobreviver à JANELA DE EVENTO: o /event
+ *                resolve a oferta lendo `decision_log WHERE offer_id = ?` e
+ *                devolve 404 se a linha se foi. Um `purchase` chega horas
+ *                depois do `impression`, então 7 dias é folga deliberada, não
+ *                estimativa.
+ *   `max_rows`   a válvula. Corta o excedente mesmo dentro da janela. Existe
+ *                para o banco não morrer num pico, e nesse caso ela PERDE
+ *                evento — é o preço de continuar respondendo, e está aqui
+ *                escrito para ninguém descobrir isso no incidente.
+ *
+ * Apaga em lotes limitados: um DELETE sobre milhões de linhas estoura o tempo
+ * do worker e volta sem ter apagado nada, que é o pior dos mundos.
+ */
+export const PRUNE_DEFAULTS = { keep_days: 7, max_rows: 2_000_000, batch: 5_000, max_batches: 20 };
+
+export async function pruneDecisionLog(db, opts = {}) {
+  const o = { ...PRUNE_DEFAULTS, ...opts };
+  const before = (await db.all('SELECT COUNT(*) AS n FROM decision_log'))[0].n;
+  const cutoff = new Date(Date.now() - o.keep_days * 86400_000).toISOString();
+
+  let deletedByAge = 0;
+  for (let i = 0; i < o.max_batches; i++) {
+    const r = await db.run(
+      `DELETE FROM decision_log WHERE offer_id IN (
+         SELECT offer_id FROM decision_log WHERE ts < ? ORDER BY ts LIMIT ?)`,
+      [cutoff, o.batch],
+    );
+    // O driver do env.DB nem sempre devolve linhas afetadas; conferir pelo total
+    // é o que funciona nos dois (node:sqlite nos testes, env.DB em produção).
+    const now = (await db.all('SELECT COUNT(*) AS n FROM decision_log'))[0].n;
+    const foi = before - deletedByAge - now;
+    deletedByAge += foi;
+    if (foi <= 0) break;
+    void r;
+  }
+
+  let deletedByCap = 0;
+  let restante = (await db.all('SELECT COUNT(*) AS n FROM decision_log'))[0].n;
+  for (let i = 0; i < o.max_batches && restante > o.max_rows; i++) {
+    const excedente = Math.min(o.batch, restante - o.max_rows);
+    await db.run(
+      `DELETE FROM decision_log WHERE offer_id IN (
+         SELECT offer_id FROM decision_log ORDER BY ts LIMIT ?)`,
+      [excedente],
+    );
+    const agora = (await db.all('SELECT COUNT(*) AS n FROM decision_log'))[0].n;
+    if (agora >= restante) break;
+    deletedByCap += restante - agora;
+    restante = agora;
+  }
+
+  return {
+    before, after: restante, cutoff,
+    deleted_by_age: deletedByAge, deleted_by_cap: deletedByCap,
+    truncated: deletedByAge >= o.batch * o.max_batches,
+  };
+}
+
+async function handlePrune(request, url, db) {
+  const q = url.searchParams;
+  const body = request.method === 'POST' ? await readJson(request).catch(() => ({})) : {};
+  const num = (k, lo, hi) => {
+    const v = body[k] ?? (q.get(k) != null ? Number(q.get(k)) : undefined);
+    return v == null || Number.isNaN(Number(v)) ? undefined : Math.max(lo, Math.min(hi, Number(v)));
+  };
+  const opts = {};
+  for (const [k, lo, hi] of [['keep_days', 1, 365], ['max_rows', 10_000, 50_000_000], ['batch', 100, 20_000], ['max_batches', 1, 200]]) {
+    const v = num(k, lo, hi);
+    if (v !== undefined) opts[k] = v;
+  }
+  return json({ ok: true, ...(await pruneDecisionLog(db, opts)) });
+}
+
 async function handleCurate(table, request, db) {
   if (!CURATE_TABLES.has(table)) {
     return json({ error: 'unknown_table', table, allowed: [...CURATE_TABLES] }, 400);
@@ -1473,7 +1587,15 @@ async function handleCurate(table, request, db) {
   );
 
   const total = (await db.all(`SELECT COUNT(*) AS n FROM ${physicalTable(table)}`))[0].n;
-  return json({ ok: true, table, received: rows.length, applied: n, table_rows: total, errors });
+
+  // Poda oportunista: a carga é diária e já está fora do caminho do shopper, o
+  // que a torna o lugar certo para pagar a retenção. Orçamento pequeno de
+  // propósito — a carga não pode virar refém da limpeza; o resto sai no /prune.
+  let pruned;
+  try { pruned = await pruneDecisionLog(db, { max_batches: 3 }); }
+  catch (e) { pruned = { error: String(e.message || e) }; }
+
+  return json({ ok: true, table, received: rows.length, applied: n, table_rows: total, errors, pruned });
 }
 
 async function bulkInsert(db, spec, tuples) {

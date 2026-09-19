@@ -284,9 +284,18 @@ específica. O mesmo produto vencendo em duas vagas ocupa a **menor**.
 merchandising da marca mais o estado do estoque, então não é aberto. Devolve as
 regras mais o estado calculado: `expired`, `not_started`, `effective`,
 `offer_in_catalog` (avisa regra apontando para SKU que não existe) e
-`performance`, que lê o braço `|pin` do bandit — `impressions`, `accepts` e um
-`take_rate` que só vem preenchido a partir de 300 impressões, porque abaixo
-disso a taxa mente e é na cauda que ela aparece. Dentro de
+`pinned_product_performance`, que lê o braço `|pin` do bandit.
+
+Esse número é **do produto fixado**, não da regra: `offer_stats` tem marca,
+âncora, superfície, goal e segmento — não tem vaga nem gatilho. Duas regras que
+fixam o mesmo SKU no mesmo escopo compartilham o total. O `take_rate` só vem
+preenchido a partir de 300 impressões; abaixo disso a taxa mente, e é na cauda
+que ela aparece.
+
+Filtrar por `surface`/`goal` inclui as regras **curinga**, porque elas também
+governam aquele escopo — e é só com o recorte que a ordem da lista responde
+"qual regra manda no carrinho". Sem ele, a lista agrupa por escopo, já que
+regras de superfícies diferentes nunca disputam entre si. Dentro de
 cada vaga a lista vem **na ordem da disputa**, usando o mesmo comparador do
 motor — a primeira é a que venceria.
 

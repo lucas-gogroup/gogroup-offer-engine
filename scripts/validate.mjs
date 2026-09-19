@@ -144,7 +144,10 @@ for (const brand of MARCAS) {
   // "OK — 0 ofertas avaliadas". Oito verdes falsos são piores que uma falha.
   if (amostra.error) {
     check(`varredura de ${brand} respondeu`, false, `a API recusou: ${amostra.error}`);
-    break;
+    // `continue`, não `break`: com break as marcas seguintes ficavam sem
+    // varredura e o check de portão as acusava de bridge de kits quebrado —
+    // um diagnóstico errado causado pela falha de OUTRA marca.
+    continue;
   }
   const pool = amostra.offers || [];
   const skus = pool.map((o) => o.sku).slice(0, 25);
@@ -164,10 +167,39 @@ for (const brand of MARCAS) {
     for (const o of r.offers || []) {
       emitidas++;
       const teto = tetoDe(cartTotal);
-      // A varredura roda sem gap, então nenhuma oferta pode invocar a dispensa
-      // de quem fecha o benefício: aqui o teto vale liso.
-      if (o.closes_benefit) { furos.push(`inesperado: ${o.sku} diz fechar benefício sem gap`); furaTeto++; }
-      else if (o.price > teto + 1e-9) { furaTeto++; furos.push(`teto: ${brand}/${sku} → ${o.sku} R$${o.price} (carrinho R$${cartTotal}, teto R$${teto.toFixed(2)})`); }
+      // A varredura não manda gap, mas a marca pode ter `free_shipping_threshold`
+      // na config — e aí o motor calcula o gap sozinho, como faz em produção
+      // quando o tema não informa nada. Tratar isso como furo faria o checklist
+      // acusar a própria configuração da marca; o certo é cobrar a REGRA DO GAP:
+      // quem fecha o benefício pode passar do teto ordinário, mas não pode
+      // passar de `gap_overshoot_max × gap`.
+      const thr = cfg.free_shipping_threshold;
+      const gapCfg = thr != null && cartTotal < thr ? thr - cartTotal : 0;
+      // A oferta é legal se passa no teto ordinário OU se é perdoada por fechar
+      // o benefício. `capExemptByBenefit` (engine.js:178) é DISPENSA do teto, não
+      // um teto extra: item de R$ 39,90 em carrinho de R$ 69,90 passa no teto
+      // normal e não precisa de perdão, mesmo fechando o frete. Cobrar
+      // `gap_overshoot_max` de toda oferta com `closes_benefit` acusaria como
+      // furo o que o motor documenta como correto.
+      const tetoGap = gapCfg > 0 ? (cfg.gap_overshoot_max ?? 1.5) * gapCfg : 0;
+      const passaTeto = o.price <= teto + 1e-9;
+      const perdoado = o.closes_benefit && gapCfg > 0 && o.price <= tetoGap + 1e-9;
+      if (!passaTeto && !perdoado) {
+        furaTeto++;
+        furos.push(o.closes_benefit
+          ? `overshoot: ${brand}/${sku} → ${o.sku} R$${o.price} acima do teto R$${teto.toFixed(2)} e do perdão R$${tetoGap.toFixed(2)} (gap R$${gapCfg.toFixed(2)})`
+          : `teto: ${brand}/${sku} → ${o.sku} R$${o.price} (carrinho R$${cartTotal}, teto R$${teto.toFixed(2)})`);
+      }
+      // o rótulo tem de ser verdadeiro: sem gap não se fecha benefício nenhum
+      if (o.closes_benefit && !(gapCfg > 0)) {
+        furaTeto++;
+        furos.push(`rótulo falso: ${brand}/${sku} → ${o.sku} diz fechar benefício sem gap (threshold ${thr ?? 'nulo'}, carrinho R$${cartTotal})`);
+      }
+      // e a promessa tem de se cumprir: somado ao carrinho, alcança o threshold
+      if (o.closes_benefit && thr != null && o.cart_total_after != null && o.cart_total_after + 1e-9 < thr) {
+        furaTeto++;
+        furos.push(`promessa falsa: ${brand}/${sku} → ${o.sku} diz fechar em R$${o.cart_total_after} < R$${thr}`);
+      }
       if (o.price > (cfg.price_cap_uplift_max ?? 1.5) * cartTotal + 1e-9 && !o.closes_benefit) {
         furos.push(`uplift: ${brand}/${sku} → ${o.sku} R$${o.price} em carrinho R$${cartTotal}`); furaTeto++;
       }
@@ -193,7 +225,7 @@ check('PORTÃO ativo em toda marca (kit que contém item do carrinho é barrado)
 // zero oferta todas passam sem ter medido nada.
 check('a varredura produziu ofertas para avaliar', emitidas > 0,
   `${emitidas} ofertas em ${MARCAS.length} marcas`);
-check('nenhuma oferta fura o teto de preço da marca', furaTeto === 0, `${emitidas} ofertas avaliadas`);
+check('nenhuma oferta fura o teto de preço nem a faixa de gap da marca', furaTeto === 0, `${emitidas} ofertas avaliadas`);
 check('nenhuma oferta abaixo do piso de preço (§3.1)', furaMinPrice === 0, `${emitidas} ofertas avaliadas`);
 check('nenhum copy de escassez com a urgência desligada', escassezFalsa === 0, `${emitidas} ofertas avaliadas`);
 check('nenhum rótulo interno de linha na tela do cliente', jargao === 0, `${emitidas} ofertas avaliadas`);
