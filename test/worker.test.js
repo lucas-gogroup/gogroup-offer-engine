@@ -1703,3 +1703,94 @@ test('/pins lista a regra vigente antes da pausada mais específica', async () =
   });
   assert.equal(rec.body.offers[0].sku, 'RT01015', 'e é mesmo a que o motor aplica');
 });
+
+test('carrinho grande não perde as travas de integridade', async () => {
+  const env = newEnv();
+  await seed(env);
+  // O kit está na posição 110 de um carrinho de 120 linhas. Cortar o carrinho
+  // antes de derivar cartSkus fazia ele sumir da trava e o motor devolvia de
+  // volta um kit que o shopper já tem — a falha que o PORTÃO existe para impedir.
+  const cart = Array.from({ length: 109 }, (_, i) => ({ sku: `X${i}`, qty: 1, price: 1 }));
+  cart.push({ sku: 'RT01015', qty: 1, price: 79.90 });
+  for (let i = 0; i < 10; i++) cart.push({ sku: `Y${i}`, qty: 1, price: 1 });
+
+  const { status, body } = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', cart, cart_total: 198.90, n: 5,
+  });
+  assert.equal(status, 200);
+  assert.ok(!(body.offers || []).some((o) => o.sku === 'KRT99078'),
+    'o kit contém RT01015, que está no carrinho');
+});
+
+test('delete por vaga respeita o escopo e nomeia o que apagou', async () => {
+  const env = newEnv();
+  await seed(env);
+  const base = { brand: 'rituaria', slot: 1, trigger_type: 'always' };
+  await call(env, 'POST', '/pins', { ...base, surface: 'cart', offer_sku: 'RT02001' }, true);
+  await call(env, 'POST', '/pins', { ...base, surface: 'pdp', offer_sku: 'RT01015' }, true);
+
+  // Limpar "a vaga 1 da PDP" levava junto a regra do carrinho, com ok e sem
+  // dizer o que destruiu.
+  const r = await call(env, 'POST', '/pins/delete',
+    { brand: 'rituaria', slot: 1, surface: 'pdp' }, true);
+  assert.equal(r.body.deleted, 1);
+  assert.equal(r.body.rules[0].surface, 'pdp');
+  assert.equal(r.body.rules[0].offer_sku, 'RT01015');
+
+  const resta = await call(env, 'GET', '/pins?brand=rituaria', undefined, true);
+  assert.equal(resta.body.count, 1);
+  assert.equal(resta.body.rules[0].surface, 'cart');
+});
+
+test('/pins filtra por escopo na leitura', async () => {
+  const env = newEnv();
+  await seed(env);
+  const base = { brand: 'rituaria', slot: 1, trigger_type: 'always' };
+  await call(env, 'POST', '/pins', { ...base, surface: 'cart', offer_sku: 'RT02001' }, true);
+  await call(env, 'POST', '/pins', { ...base, surface: 'pdp', offer_sku: 'RT01015' }, true);
+
+  const so = await call(env, 'GET', '/pins?brand=rituaria&surface=cart', undefined, true);
+  assert.equal(so.body.count, 1);
+  assert.equal(so.body.rules[0].offer_sku, 'RT02001');
+});
+
+test('/pins devolve o desempenho do braço |pin da regra', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [pinRow({ slot: 1, offer_sku: 'RT01008' })],
+  }, true);
+
+  const rec = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', n: 3, cart_total: 79.90,
+    cart: [{ sku: 'RT01015', qty: 1, price: 79.90 }],
+  });
+  await call(env, 'POST', '/event', { offer_id: rec.body.offer_id, event: 'impression' });
+  await call(env, 'POST', '/event', { offer_id: rec.body.offer_id, event: 'accept' });
+
+  // O braço era só escrita: nenhuma rota o lia, e "defender ou matar uma regra
+  // com número" não era alcançável pela API.
+  const { body } = await call(env, 'GET', '/pins?brand=rituaria', undefined, true);
+  assert.equal(body.rules[0].performance.impressions, 1);
+  assert.equal(body.rules[0].performance.accepts, 1);
+  assert.equal(body.rules[0].performance.take_rate, null, 'amostra insuficiente não vira taxa');
+  assert.equal(body.rules[0].performance.conclusive, false);
+});
+
+test('o stack de um 500 só sai com bearer', async () => {
+  const env = newEnv();
+  // Sem seed e com o DB fechado, qualquer rota estoura no catch do topo.
+  env.DB.close();
+
+  const anonimo = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', cart: [{ sku: 'X', qty: 1, price: 1 }], cart_total: 1,
+  });
+  assert.equal(anonimo.status, 500);
+  assert.ok(anonimo.body.error, 'a mensagem continua');
+  assert.equal(anonimo.body.stack, undefined, 'o rastro de pilha, não');
+
+  const comToken = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', cart: [{ sku: 'X', qty: 1, price: 1 }], cart_total: 1,
+  }, true);
+  assert.ok(comToken.body.stack);
+});

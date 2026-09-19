@@ -49,7 +49,13 @@ export default {
       for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);
       return res;
     } catch (err) {
-      return json({ error: String(err && err.message || err), stack: err && err.stack }, 500, cors);
+      // O stack só com bearer, como o `debug`. Ele saía no corpo de qualquer
+      // 500 numa API pública — e era o que transformava cada entrada sem teto
+      // num vazamento, motivando limites apertados no lugar errado.
+      return json({
+        error: String(err && err.message || err),
+        stack: autorizado(request, env) ? err && err.stack : undefined,
+      }, 500, cors);
     }
   },
 };
@@ -136,12 +142,13 @@ async function handleRecommend(request, db, env) {
   const goal = ['aov', 'stock', 'margin'].includes(body.goal) ? body.goal : 'aov';
   const segment = body.customer && body.customer.is_returning ? 'returning' : 'new';
   const n = Math.max(1, Math.min(10, Number(body.n) || 1));
-  // Teto no carrinho, como o `cart=` do /offers já tinha — e aqui importa mais,
-  // porque esta é a rota ABERTA. Os SKUs do carrinho entram três vezes nos binds
-  // da query única, então ~340 itens já passam do máximo de variáveis do SQLite:
-  // o erro sobe para o catch do topo e o 500 devolve o stack.
-  const cart = (Array.isArray(body.cart) ? body.cart : []).slice(0, MAX_CART_ITENS);
-  const gifts = (Array.isArray(body.gifts) ? body.gifts : []).slice(0, MAX_CART_ITENS);
+  // O carrinho entra INTEIRO. O limite de binds do SQLite é problema da query,
+  // e é lá que ele é tratado — cortar aqui tirava SKU do `cartSkus`, e com ele
+  // as travas de integridade: um kit na posição 110 de um carrinho de 120 linhas
+  // deixava de barrar o próprio kit, que é precisamente a falha que o PORTÃO
+  // existe para impedir. Brinde então nem chega a virar bind.
+  const cart = Array.isArray(body.cart) ? body.cart : [];
+  const gifts = Array.isArray(body.gifts) ? body.gifts : [];
 
   const out = await runDecision(db, {
     brand, surface, goal, segment, n, cart, gifts,
@@ -219,7 +226,12 @@ async function runDecision(db, opts) {
   // chamada, o que colocava o /recommend em ~1 s. Agora a afinidade, os
   // denominadores e os contadores do bandit vêm juntos com o candidato, e de
   // kits só se lê o que o carrinho realmente toca.
-  const cartList = [...cartSkus];
+  // O teto vive AQUI, sobre a lista que vira bind — não sobre o carrinho.
+  // `cartSkus` segue inteiro e é o que o `hardFilterReject` usa para
+  // `sku_in_cart`, então nenhuma trava de integridade perde contexto por
+  // tamanho. Só as subqueries de kit, que precisam de `IN (?, …)`, param no
+  // limite: cada SKU entra três vezes, e 999 é o teto de variáveis do SQLite.
+  const cartList = [...cartSkus].slice(0, MAX_CART_BINDS);
   const inCart = cartList.map(() => '?').join(',');
 
   // Duas leituras, não cinco. O que o candidato precisa — afinidade com a
@@ -781,7 +793,10 @@ const PIN_COLS = ['brand', 'slot', 'trigger_type', 'trigger_key', 'offer_sku',
 
 const MAX_SLOT = 10; // o teto de `n` em /recommend
 const MAX_CART_SIM = 30;    // itens do carrinho de teste em /offers?cart=
-const MAX_CART_ITENS = 100; // itens aceitos do carrinho no /recommend
+// SKUs distintos do carrinho que viram bind. Cada um entra 3× nas subqueries de
+// kit, mais 7 parâmetros fixos: 300 × 3 + 7 = 907, abaixo do teto de 999 do
+// SQLite. Acima disso as travas de kit degradam; as de JS, não.
+const MAX_CART_BINDS = 300;
 
 const SPECS = {
   product: {
@@ -1092,6 +1107,13 @@ async function handleListPins(url, db) {
     where.push('r.slot = ?');
     params.push(s);
   }
+  // Escopo é filtro de leitura também: sem ele, `?slot=1` devolve a regra do
+  // carrinho e a da PDP intercaladas, as duas com `effective: true`, e não há
+  // como o painel saber qual governa o carrinho.
+  for (const campo of ['surface', 'goal']) {
+    const v = q.get(campo);
+    if (v != null && v !== '') { where.push(`r.${campo} = ?`); params.push(pinScope(v)); }
+  }
   const activeQ = q.get('active');
   if (activeQ != null && activeQ !== '') {
     // O mesmo vocabulário da escrita. Com o `truthy` genérico, `?active=sim`
@@ -1105,9 +1127,18 @@ async function handleListPins(url, db) {
     params.push(v);
   }
 
+  // O braço `|pin` do bandit sai aqui. Sem isto ele era só escrita: nenhuma
+  // rota o lia, e a promessa de "defender ou matar uma regra com número" não
+  // era alcançável pela API.
   const rows = await db.all(
     `SELECT r.*, p.sku AS catalogo_sku, p.title AS offer_title, p.price AS offer_price,
-            p.available AS offer_available
+            p.available AS offer_available,
+            (SELECT SUM(impressions) FROM offer_stats os
+              WHERE os.brand = r.brand AND os.offer_sku = r.offer_sku
+                AND os.segment LIKE '%|pin') AS pin_impressions,
+            (SELECT SUM(accepts) FROM offer_stats os
+              WHERE os.brand = r.brand AND os.offer_sku = r.offer_sku
+                AND os.segment LIKE '%|pin') AS pin_accepts
        FROM pin_rule r
        LEFT JOIN product p ON p.brand = r.brand AND p.sku = r.offer_sku
       ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
@@ -1145,9 +1176,19 @@ async function handleListPins(url, db) {
     rules: rows.map((r) => {
       const expirada = !!(r.ends_at && String(r.ends_at) < now);
       const naoComecou = !!(r.starts_at && String(r.starts_at) > now);
-      const { catalogo_sku: catalogo, ...regra } = r;
+      const { catalogo_sku: catalogo, pin_impressions: imp, pin_accepts: acc, ...regra } = r;
+      const impressoes = Number(imp) || 0;
       return {
         ...regra,
+        // Abaixo de 300 impressões a taxa mente, e é na cauda que ela aparece:
+        // devolver `take_rate: null` é mais honesto que um número que ninguém
+        // deveria usar para decidir.
+        performance: {
+          impressions: impressoes,
+          accepts: Number(acc) || 0,
+          take_rate: impressoes >= 300 ? (Number(acc) || 0) / impressoes : null,
+          conclusive: impressoes >= 300,
+        },
         expired: expirada,
         not_started: naoComecou,
         effective: Number(r.active) === 1 && !expirada && !naoComecou,
@@ -1250,9 +1291,14 @@ async function handleSetPin(request, db) {
     } catch (e) {
       return json({ error: 'invalid_rule', detail: String(e.message || e) }, 400);
     }
+    // `ON CONFLICT` e não `OR REPLACE`: se a linha aparecer entre o SELECT do
+    // `pinAtual` e esta escrita — outra aba salvando, ou um /curate/pins
+    // correndo junto —, `OR REPLACE` a sobrescreveria inteira e carimbaria
+    // `created_at`, desfazendo o cuidado que o spec do lote tem com ele.
     await db.run(
-      `INSERT OR REPLACE INTO pin_rule (${PIN_COLS.join(', ')})
-       VALUES (${PIN_COLS.map(() => '?').join(', ')})`,
+      `INSERT INTO pin_rule (${PIN_COLS.join(', ')})
+       VALUES (${PIN_COLS.map(() => '?').join(', ')})
+       ${SPECS.pins.conflict}`,
       tuple,
     );
     row = (await db.all(`SELECT * FROM pin_rule WHERE ${PIN_ID_COLS}`,
@@ -1347,9 +1393,21 @@ async function handleDeletePin(request, db) {
     onde = PIN_ID_COLS;
     params = [brand, slot, tipo, pinNaturalKey(body), pinScope(body.surface), pinScope(body.goal)];
   } else if (slot != null) {
+    // Escopo é identidade em todo o resto da feature, e aqui era ignorado:
+    // limpar "a vaga 1 da PDP" apagava junto a regra do carrinho e respondia ok
+    // sem nomear o que destruiu. Informado, ele recorta; omitido, a vaga
+    // inteira é apagada mesmo — e a resposta diz quais regras se foram.
     escopo = 'vaga';
     onde = 'brand=? AND slot=?';
     params = [brand, slot];
+    if (body.surface != null && body.surface !== '') {
+      onde += ' AND surface=?';
+      params.push(pinScope(body.surface));
+    }
+    if (body.goal != null && body.goal !== '') {
+      onde += ' AND goal=?';
+      params.push(pinScope(body.goal));
+    }
   } else {
     return json({ error: 'slot_or_trigger_type_required' }, 400);
   }
@@ -1358,8 +1416,11 @@ async function handleDeletePin(request, db) {
   // driver devolve linhas afetadas, e um `null` tratado como sucesso recria
   // exatamente o desfecho que o 404 existe para evitar: o operador acredita que
   // removeu, e a regra continua decidindo o carrinho.
-  const alvo = (await db.all(`SELECT COUNT(*) AS n FROM pin_rule WHERE ${onde}`, params))[0].n;
-  if (!alvo) {
+  const alvos = await db.all(
+    `SELECT slot, trigger_type, trigger_key, surface, goal, offer_sku
+       FROM pin_rule WHERE ${onde} ORDER BY slot`, params,
+  );
+  if (!alvos.length) {
     return json({ error: 'rule_not_found', brand, slot, scope: escopo }, 404);
   }
   await db.run(`DELETE FROM pin_rule WHERE ${onde}`, params);
@@ -1367,7 +1428,13 @@ async function handleDeletePin(request, db) {
   const n = (await db.all(
     'SELECT COUNT(*) AS n FROM pin_rule WHERE brand = ?', [brand],
   ))[0].n;
-  return json({ ok: true, brand, scope: escopo, deleted: Number(alvo), remaining: n });
+  return json({
+    ok: true, brand, scope: escopo, deleted: alvos.length,
+    // Nomear o que se foi: num delete por vaga, "apagou 3" não diz se levou
+    // junto a regra de outra superfície que ninguém queria perder.
+    rules: alvos.map((a) => ({ rule: `${a.slot}|${a.trigger_type}|${a.trigger_key}`, surface: a.surface, goal: a.goal, offer_sku: a.offer_sku })),
+    remaining: n,
+  });
 }
 
 async function handleCurate(table, request, db) {

@@ -280,10 +280,13 @@ específica. O mesmo produto vencendo em duas vagas ocupa a **menor**.
 
 ### Chamadas
 
-`GET /pins?brand=&slot=&active=` (bearer) — é o plano de merchandising da marca
-mais o estado do estoque, então não é aberto. Devolve as
-regras mais o estado calculado: `expired`, `not_started`, `effective` e
-`offer_in_catalog` (avisa regra apontando para SKU que não existe). Dentro de
+`GET /pins?brand=&slot=&active=&surface=&goal=` (bearer) — é o plano de
+merchandising da marca mais o estado do estoque, então não é aberto. Devolve as
+regras mais o estado calculado: `expired`, `not_started`, `effective`,
+`offer_in_catalog` (avisa regra apontando para SKU que não existe) e
+`performance`, que lê o braço `|pin` do bandit — `impressions`, `accepts` e um
+`take_rate` que só vem preenchido a partir de 300 impressões, porque abaixo
+disso a taxa mente e é na cauda que ela aparece. Dentro de
 cada vaga a lista vem **na ordem da disputa**, usando o mesmo comparador do
 motor — a primeira é a que venceria.
 
@@ -314,7 +317,9 @@ por isso o aviso na escrita. Regra inválida volta `400 invalid_rule` com um
 `detail` legível; um corpo só com a identidade volta `400 nothing_to_update`.
 
 `POST /pins/delete` (bearer) — `{brand, slot, trigger_type, trigger_sku}` remove
-uma regra; `{brand, slot}` limpa a vaga inteira. **Devolve `404 rule_not_found`
+uma regra; `{brand, slot}` limpa a vaga inteira, e aceita `surface`/`goal` para
+recortar por escopo. A resposta lista o que apagou: num delete por vaga,
+"apagou 3" não diz se levou junto a regra de outra superfície. **Devolve `404 rule_not_found`
 quando nada casou** — apagar nada e responder ok faria o operador acreditar que
 removeu enquanto a regra segue decidindo o carrinho. É POST porque o CORS do app
 só libera `GET, POST, OPTIONS`.
