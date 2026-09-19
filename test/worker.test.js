@@ -1026,9 +1026,12 @@ test('pausar uma regra não apaga vigência, escopo nem nota', async () => {
   assert.equal(criada.body.created, true);
 
   // A doc apresenta isto como a forma de pausar. Com INSERT OR REPLACE cru,
-  // apagaria vigência, escopo, prioridade e nota.
+  // apagaria vigência, escopo, prioridade e nota. O escopo faz parte da
+  // identidade, então entra junto — é o que permite ter a mesma vaga com
+  // produtos diferentes no carrinho e na PDP.
   const pausada = await call(env, 'POST', '/pins', {
-    brand: 'rituaria', slot: 2, trigger_type: 'sku', trigger_sku: 'RT01008', active: 0,
+    brand: 'rituaria', slot: 2, trigger_type: 'sku', trigger_sku: 'RT01008',
+    surface: 'cart', goal: 'aov', active: 0,
   }, true);
   assert.equal(pausada.body.created, false, 'é edição, não criação');
 
@@ -1493,4 +1496,78 @@ test('produto já fixado numa vaga menor é avisado, qualquer que seja o gatilho
   }, true);
   assert.equal(nova.body.warnings.length, 1);
   assert.match(nova.body.warnings[0], /nunca vai aparecer/);
+});
+
+test('escopo é identidade: carrinho e PDP convivem na mesma vaga', async () => {
+  const env = newEnv();
+  await seed(env);
+  const base = { brand: 'rituaria', slot: 1, trigger_type: 'always' };
+
+  await call(env, 'POST', '/pins', { ...base, surface: 'cart', offer_sku: 'RT02001' }, true);
+  const pdp = await call(env, 'POST', '/pins', { ...base, surface: 'pdp', offer_sku: 'RT01015' }, true);
+
+  // Antes, a segunda casava a mesma chave, entrava no ramo de UPDATE e
+  // transformava a regra do carrinho numa regra de PDP — com created:false e
+  // warnings vazio. A do carrinho simplesmente sumia.
+  assert.equal(pdp.body.created, true, 'é outra regra, não edição da primeira');
+
+  const lista = await call(env, 'GET', '/pins?brand=rituaria&slot=1', undefined, true);
+  assert.equal(lista.body.count, 2);
+  assert.deepEqual(lista.body.rules.map((r) => r.surface).sort(), ['cart', 'pdp']);
+
+  const carrinho = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', surface: 'cart', n: 3, cart_total: 89.90,
+    cart: [{ sku: 'RT01008', qty: 1, price: 89.90 }],
+  });
+  assert.equal(carrinho.body.offers[0].sku, 'RT02001');
+});
+
+test('slot fracionário não sobrescreve a regra da vaga vizinha', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/pins',
+    { brand: 'rituaria', slot: 2, trigger_type: 'always', offer_sku: 'RT02001' }, true);
+
+  // Arredondar aqui encontrava a regra da vaga 2 e trocava o produto dela,
+  // devolvendo created:false sem aviso nenhum.
+  const r = await call(env, 'POST', '/pins',
+    { brand: 'rituaria', slot: 1.6, trigger_type: 'always', offer_sku: 'RT01015' }, true);
+  assert.equal(r.status, 400);
+  assert.match(r.body.detail, /inteiro/);
+
+  const lista = await call(env, 'GET', '/pins?brand=rituaria', undefined, true);
+  assert.equal(lista.body.count, 1);
+  assert.equal(lista.body.rules[0].offer_sku, 'RT02001', 'a vaga 2 ficou intacta');
+});
+
+test('priority vazio numa edição parcial não zera o desempate', async () => {
+  const env = newEnv();
+  await seed(env);
+  const id = { brand: 'rituaria', slot: 1, trigger_type: 'sku', trigger_sku: 'RT01008' };
+  await call(env, 'POST', '/pins', { ...id, offer_sku: 'RT02001', priority: 10 }, true);
+
+  const r = await call(env, 'POST', '/pins', { ...id, active: 0, priority: null }, true);
+  assert.equal(r.status, 400);
+  assert.match(r.body.detail, /priority vazio/);
+
+  const lista = await call(env, 'GET', '/pins?brand=rituaria', undefined, true);
+  assert.equal(lista.body.rules[0].priority, 10);
+});
+
+test('o log conta regra APLICADA, não regra que casou', async () => {
+  const env = newEnv();
+  await seed(env);
+  // KRT99078 contém RT01015: casa o gatilho e é barrada por integridade.
+  await call(env, 'POST', '/curate/pins', {
+    rows: [pinRow({ slot: 1, offer_sku: 'KRT99078' })],
+  }, true);
+  await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', n: 3, cart_total: 79.90,
+    cart: [{ sku: 'RT01015', qty: 1, price: 79.90 }],
+  });
+
+  const log = await call(env, 'GET', '/log?brand=rituaria&limit=1', undefined, true);
+  const ctx = log.body.entries[0].context;
+  assert.equal(ctx.pin_rules_applied, 0, 'nenhuma oferta curada saiu');
+  assert.equal(ctx.pin_rules_barred, 1);
 });

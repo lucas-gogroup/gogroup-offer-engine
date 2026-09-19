@@ -288,14 +288,19 @@ motor — a primeira é a que venceria.
 
 `POST /pins` (bearer) — grava **uma** regra, com **edição parcial**. A identidade
 é `brand` + `slot` + `trigger_type` + o gatilho (`trigger_sku`, ou
-`trigger_field` + `trigger_value`). Se a regra já existe, só os campos enviados
+`trigger_field` + `trigger_value`) + `surface` + `goal`. O escopo faz parte da
+identidade de propósito: é o que permite "vaga 1 = A no carrinho" e "vaga 1 = B
+na PDP" coexistirem. Regra criada com escopo explícito precisa ser identificada
+com ele; quem não usa escopo cai em `*` nos dois e não percebe diferença. Se a regra já existe, só os campos enviados
 mudam, num `UPDATE` das colunas informadas — então duas edições simultâneas de
 campos diferentes não se atropelam. Por isso pausar é só `{"active": 0}` junto da
 identidade, sem perder vigência, escopo, prioridade nem nota.
 
-Editáveis desta forma: `offer_sku`, `surface`, `goal`, `priority`, `active`,
-`starts_at`, `ends_at`, `note`. **Vaga e gatilho não**, porque mudá-los muda a
-identidade — isso é criar outra regra e apagar a antiga.
+Editáveis desta forma: `offer_sku`, `priority`, `active`, `starts_at`,
+`ends_at`, `note`. **Vaga, gatilho e escopo não**, porque são a identidade —
+mudá-los é criar outra regra e apagar a antiga. `active` e `priority` recusam
+valor vazio: é o que um formulário manda no campo não tocado, e aceitá-lo
+despausaria a regra ou zeraria o desempate em silêncio.
 
 A resposta traz `created` dizendo se foi criação ou edição, e `warnings` quando
 `offer_sku` ou `trigger_sku` não estão no catálogo da marca. O casamento por SKU

@@ -286,7 +286,8 @@ async function runDecision(db, opts) {
             ${compHit}    AS comp_hit,
             bo.n_orders AS brand_orders,
             ao.n_orders AS anchor_orders,
-            pr.wire AS pin_rules,
+            CASE WHEN p.sku = (SELECT MIN(p2.sku) FROM product p2 WHERE p2.brand = p.brand)
+                 THEN pr.wire END AS pin_rules,
             ${cfgCols.map((c) => `bc.${c} AS cfg_${c}`).join(',\n            ')}
        FROM product p
        LEFT JOIN affinity a
@@ -394,7 +395,13 @@ async function runDecision(db, opts) {
   // Curadoria. `no_pins` existe para o simulador do painel mostrar, lado a
   // lado, o ranking com e sem intervenção humana — é o que permite defender ou
   // matar uma regra olhando a tela.
-  const pinRules = opts.noPins ? [] : parsePinRules(first && first.pin_rules);
+  // O wire vem em UMA linha só, não em todas. A config se repete nas 241 linhas
+  // a custo desprezível (24 escalares), mas a serialização das regras é um blob:
+  // com algumas dezenas de regras seriam megabytes materializados por request,
+  // num motor que já gasta ~115 ms por query. O `CASE` da query prende o blob na
+  // primeira linha da marca, e aqui se procura por ele em vez de assumir a
+  // posição — `products` não tem ORDER BY.
+  const pinRules = opts.noPins ? [] : parsePinRules(products.find((p) => p.pin_rules)?.pin_rules);
 
   const ctx = {
     cfg, cartSkus, giftSkus, giftKeys, cartTotal, kitComponentsOf,
@@ -432,7 +439,14 @@ async function runDecision(db, opts) {
     threshold_label: thresholdLabel,
     cart_skus: [...cartSkus], gift_skus: [...giftSkus],
     pool_size: products.length, candidates_after_filters: offers.length,
-    ...(pins.length ? { slots: n, pin_rules_matched: pins.length } : {}),
+    // Aplicadas, não "casaram": três regras podem casar com o carrinho e as
+    // três serem barradas por integridade. Contar tentativa faria quem audita o
+    // log concluir que a curadoria agiu quando nenhuma oferta curada saiu.
+    ...(pins.length ? {
+      slots: n,
+      pin_rules_applied: pins.filter((p) => p.applied).length,
+      pin_rules_barred: pins.filter((p) => !p.applied).length,
+    } : {}),
   };
   const decision = top.length
     ? { offer_sku: top[0].sku, variant_id: top[0].variant_id, price: top[0].price,
@@ -1008,7 +1022,7 @@ function pinTuple(r, now) {
     now];
 }
 
-/** Chave natural a partir de um corpo de request, para upsert e delete. */
+/** A parte do gatilho que entra na chave. */
 function pinNaturalKey(body) {
   const tipo = String(body.trigger_type ?? '').trim().toLowerCase();
   if (tipo === 'sku') return String(body.trigger_sku ?? body.trigger_key ?? '').trim();
@@ -1016,6 +1030,22 @@ function pinNaturalKey(body) {
     return `${String(body.trigger_field ?? '').trim().toLowerCase()}=${normTax(body.trigger_value)}`;
   }
   return '';
+}
+
+const PIN_ID_COLS = 'brand=? AND slot=? AND trigger_type=? AND trigger_key=? AND surface=? AND goal=?';
+
+/**
+ * Identidade completa de uma regra a partir de um corpo de request, ou null se
+ * o corpo não a determina. O `slot` é exigido INTEIRO aqui também: arredondar
+ * faria um `slot: 1.6` encontrar a regra da vaga 2 e sobrescrevê-la, com
+ * `created: false` e sem aviso nenhum — destruição silenciosa de dado.
+ */
+function pinIdentity(body) {
+  const brand = normBrand(body.brand);
+  const slot = Number(body.slot);
+  const tipo = String(body.trigger_type ?? '').trim().toLowerCase();
+  if (!brand || !Number.isInteger(slot) || slot < 1 || slot > MAX_SLOT || !tipo) return null;
+  return [brand, slot, tipo, pinNaturalKey(body), pinScope(body.surface), pinScope(body.goal)];
 }
 
 async function handleListPins(url, db) {
@@ -1096,14 +1126,9 @@ async function handleListPins(url, db) {
 
 /** A linha existente que este corpo identifica, ou null. */
 async function pinAtual(db, body) {
-  const brand = normBrand(body.brand);
-  const slot = Number(body.slot);
-  const tipo = String(body.trigger_type ?? '').trim().toLowerCase();
-  if (!brand || !Number.isFinite(slot) || !tipo) return null;
-  return (await db.all(
-    'SELECT * FROM pin_rule WHERE brand=? AND slot=? AND trigger_type=? AND trigger_key=?',
-    [brand, Math.round(slot), tipo, pinNaturalKey(body)],
-  ))[0] || null;
+  const id = pinIdentity(body);
+  if (!id) return null;
+  return (await db.all(`SELECT * FROM pin_rule WHERE ${PIN_ID_COLS}`, id))[0] || null;
 }
 
 /**
@@ -1119,7 +1144,13 @@ const PIN_EDITAVEL = {
   },
   surface: (v) => semSeparador(pinScope(v), 'surface'),
   goal: (v) => semSeparador(pinScope(v), 'goal'),
-  priority: pinPriority,
+  // Mesma guarda do `active`, pela mesma razão: um formulário que sempre envia
+  // o campo mandaria vazio no campo não tocado, e a prioridade configurada
+  // voltaria a 0 — trocando quem vence a vaga, com ok e sem aviso.
+  priority: (v) => {
+    if (v === '' || v === null) throw new Error('priority vazio: envie um número ou omita o campo');
+    return pinPriority(v);
+  },
   // NÃO é o `pinActive` da criação. Lá, ausente vale 1 — é o default de uma
   // regra nova. Aqui, `""` ou `null` é o que um formulário manda quando o campo
   // não foi tocado, e cair no default de 1 REATIVA uma regra pausada em
@@ -1159,15 +1190,16 @@ async function handleSetPin(request, db) {
 
     cols.push('updated_at');
     vals.push(agora);
+    // `surface` e `goal` são identidade: mudá-los cria outra regra, como a vaga
+    // e o gatilho. Por isso não estão em PIN_EDITAVEL e a chave usada aqui é a
+    // da linha encontrada, não a do corpo.
+    const id = [atual.brand, atual.slot, atual.trigger_type, atual.trigger_key,
+      atual.surface, atual.goal];
     await db.run(
-      `UPDATE pin_rule SET ${cols.map((c) => `${c} = ?`).join(', ')}
-        WHERE brand=? AND slot=? AND trigger_type=? AND trigger_key=?`,
-      [...vals, atual.brand, atual.slot, atual.trigger_type, atual.trigger_key],
+      `UPDATE pin_rule SET ${cols.map((c) => `${c} = ?`).join(', ')} WHERE ${PIN_ID_COLS}`,
+      [...vals, ...id],
     );
-    row = (await db.all(
-      'SELECT * FROM pin_rule WHERE brand=? AND slot=? AND trigger_type=? AND trigger_key=?',
-      [atual.brand, atual.slot, atual.trigger_type, atual.trigger_key],
-    ))[0];
+    row = (await db.all(`SELECT * FROM pin_rule WHERE ${PIN_ID_COLS}`, id))[0];
   } else {
     let tuple;
     try {
@@ -1180,10 +1212,8 @@ async function handleSetPin(request, db) {
        VALUES (${PIN_COLS.map(() => '?').join(', ')})`,
       tuple,
     );
-    row = (await db.all(
-      'SELECT * FROM pin_rule WHERE brand=? AND slot=? AND trigger_type=? AND trigger_key=?',
-      [tuple[0], tuple[1], tuple[2], tuple[3]],
-    ))[0];
+    row = (await db.all(`SELECT * FROM pin_rule WHERE ${PIN_ID_COLS}`,
+      [tuple[0], tuple[1], tuple[2], tuple[3], tuple[7], tuple[8]]))[0];
   }
 
   // A regra pode ter sumido entre a escrita e a releitura — outra aba no
@@ -1261,8 +1291,8 @@ async function handleDeletePin(request, db) {
       return json({ error: 'invalid_trigger_type', trigger_type: body.trigger_type }, 400);
     }
     escopo = 'regra';
-    onde = 'brand=? AND slot=? AND trigger_type=? AND trigger_key=?';
-    params = [brand, slot, tipo, pinNaturalKey(body)];
+    onde = PIN_ID_COLS;
+    params = [brand, slot, tipo, pinNaturalKey(body), pinScope(body.surface), pinScope(body.goal)];
   } else if (slot != null) {
     escopo = 'vaga';
     onde = 'brand=? AND slot=?';

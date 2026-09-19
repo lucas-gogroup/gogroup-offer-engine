@@ -92,6 +92,11 @@ CREATE TABLE IF NOT EXISTS brand_config (
 --   taxonomy -> campo=valor normalizado
 -- Materializada no mapper, não GENERATED: o repo roda em dois drivers e coluna
 -- gerada exige SQLite 3.31+.
+--
+-- surface e goal entram na PK porque são ESCOPO, e escopo é parte da identidade:
+-- sem eles, "vaga 1 = A no carrinho" e "vaga 1 = B na PDP" colidiriam, o segundo
+-- INSERT OR REPLACE apagaria o primeiro, e a resposta ainda diria applied: 2.
+-- Ambos usam '*' como "vale para todos", nunca NULL, para a PK não ter buraco.
 CREATE TABLE IF NOT EXISTS pin_rule (
   brand TEXT NOT NULL,
   slot INTEGER NOT NULL,
@@ -109,7 +114,7 @@ CREATE TABLE IF NOT EXISTS pin_rule (
   note TEXT,
   created_at TEXT,
   updated_at TEXT,
-  PRIMARY KEY (brand, slot, trigger_type, trigger_key)
+  PRIMARY KEY (brand, slot, trigger_type, trigger_key, surface, goal)
 );
 CREATE INDEX IF NOT EXISTS idx_pin_rule_brand ON pin_rule(brand, active);
 `;
