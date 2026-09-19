@@ -717,22 +717,34 @@ export function resolvePins(rules, ctx) {
   }
 
   elegiveis.sort(comparePins);
+
+  // Uma passada por vaga, em ordem crescente, resolvendo vencedor e
+  // desduplicação de produto JUNTOS.
+  //
+  // Separar as duas coisas perdia regra e mentia no relatório: a vice era
+  // descartada como "vaga já tomada", a vencedora caía depois por já estar
+  // fixada numa vaga menor, e a vaga terminava vazia — com o operador lendo que
+  // uma regra mais específica a tomou, o que era falso, enquanto a regra que
+  // teria funcionado nunca rodava. Agora, se a vencedora cai por duplicidade de
+  // produto, a seguinte assume.
+  const porVaga = new Map();
   for (const r of elegiveis) {
-    if (bySlot.has(r.slot)) { fora(r, 'vaga_ja_tomada_por_regra_mais_especifica'); continue; }
-    bySlot.set(r.slot, r);
+    if (!porVaga.has(r.slot)) porVaga.set(r.slot, []);
+    porVaga.get(r.slot).push(r);
   }
 
-  // Mesmo produto vencendo em duas vagas ocupa a MENOR. A alternativa ("o
-  // segundo colocado da regra assume") é esperta demais para ser explicada.
-  for (const slot of [...bySlot.keys()].sort((a, b) => a - b)) {
-    const r = bySlot.get(slot);
-    const sku = String(r.offer_sku);
-    if (pinnedSkus.has(sku)) {
-      bySlot.delete(slot);
-      fora(r, 'produto_ja_fixado_em_vaga_menor');
-      continue;
+  for (const slot of [...porVaga.keys()].sort((a, b) => a - b)) {
+    let assumiu = false;
+    for (const r of porVaga.get(slot)) {
+      const sku = String(r.offer_sku);
+      if (assumiu) { fora(r, 'vaga_tomada_por_regra_mais_especifica'); continue; }
+      // Mesmo produto vencendo em duas vagas ocupa a MENOR. A alternativa ("a
+      // vaga maior mostra outra coisa do mesmo produto") não existe.
+      if (pinnedSkus.has(sku)) { fora(r, 'produto_ja_fixado_em_vaga_menor'); continue; }
+      bySlot.set(slot, r);
+      pinnedSkus.add(sku);
+      assumiu = true;
     }
-    pinnedSkus.add(sku);
   }
 
   return { bySlot, pinnedSkus, discarded };

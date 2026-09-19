@@ -61,14 +61,26 @@ async function route(request, url, db, env) {
   if (p === '/' || p === '/health') return handleHealth(db);
   if (p === '/recommend' && m === 'POST') return handleRecommend(request, db);
   if (p === '/event' && m === 'POST') return handleEvent(request, db);
-  if (p === '/offers' && m === 'GET') return handleOffers(url, db);
-  if (p === '/log' && m === 'GET') return handleLog(url, db);
+  // Rotas de DIAGNÓSTICO, agora atrás do bearer.
+  //
+  // Eram abertas, e não dava mais para sustentar isso. `/log` devolve, para
+  // qualquer um na internet, a margem esperada por produto, o preço, o score e
+  // o carrinho de shoppers reais; `/offers` devolve o mesmo por âncora, com a
+  // lista de rejeitados; e as duas passaram a carregar o relatório de curadoria
+  // — o SKU que a marca quer empurrar e o código interno que o barrou.
+  //
+  // O `/recommend` é filtrado com cuidado justamente para não publicar isso, e
+  // essa proteção era teatro enquanto um GET vizinho entregava tudo. A loja não
+  // usa nenhuma das duas: o tema chama só /recommend e /event, que seguem
+  // públicos.
+  if (p === '/offers' && m === 'GET') return guard(request, env, () => handleOffers(url, db));
+  if (p === '/log' && m === 'GET') return guard(request, env, () => handleLog(url, db));
   if (p === '/config' && m === 'GET') return handleGetConfig(url, db);
   if (p === '/config' && m === 'POST') return guard(request, env, () => handleSetConfig(request, db));
-  // Curadoria. A leitura é aberta como /config e /log — é configuração, não dado
-  // de cliente. Só escrita passa pelo bearer. DELETE seria o verbo certo, mas o
-  // CORS do app libera GET/POST/OPTIONS, e /curate/reset já firmou esse padrão.
-  if (p === '/pins' && m === 'GET') return handleListPins(url, db);
+  // Curadoria. A leitura também é fechada: é o plano de merchandising da marca
+  // mais o estado do estoque. DELETE seria o verbo certo, mas o CORS do app
+  // libera GET/POST/OPTIONS, e /curate/reset já firmou esse padrão.
+  if (p === '/pins' && m === 'GET') return guard(request, env, () => handleListPins(url, db));
   if (p === '/pins' && m === 'POST') return guard(request, env, () => handleSetPin(request, db));
   if (p === '/pins/delete' && m === 'POST') return guard(request, env, () => handleDeletePin(request, db));
   if (p === '/curate/reset' && m === 'POST') return guard(request, env, () => handleReset(url, db));
@@ -862,6 +874,18 @@ function pinActive(v) {
   throw new Error(`active não reconhecido: ${v}`);
 }
 
+/**
+ * Prioridade: número, ou erro. `Number('alta') || 0` virava 0 em silêncio, e o
+ * desempate que o operador configurou simplesmente não se aplicava — com
+ * `applied: N` e `errors: []` na resposta dizendo que deu tudo certo.
+ */
+function pinPriority(v) {
+  if (v === undefined || v === null || v === '') return 0;
+  const n = Number(v);
+  if (!Number.isFinite(n)) throw new Error(`priority não numérico: ${v}`);
+  return Math.round(n);
+}
+
 // Os separadores do `wire` do group_concat. Um SKU ou rótulo que os contenha
 // produziria um registro com contagem de campos errada, e `parsePinRules` o
 // descartaria em silêncio — a regra sumiria de todo /recommend sem erro.
@@ -895,8 +919,14 @@ function pinInstant(v, borda) {
     // diferentes gravado do Worker (UTC) ou da máquina de quem opera (BRT), e
     // "31/12 23:59" morreria às 20:59 do dia 31. Quem escreve pensa em BRT.
     iso = `${s.replace(' ', 'T')}-03:00`;
+  } else if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/.test(s)) {
+    iso = s.replace(' ', 'T'); // fuso explícito: respeita-se como veio
   } else {
-    iso = s; // já traz Z ou ±HH:MM: o fuso é explícito, respeita-se
+    // Recusar, não adivinhar. Assumir "já traz fuso" aceitava "12/31/2026" — que
+    // o `new Date` lê no fuso do HOST, o bug que este função existe para evitar —
+    // e "2026-12" ou "2026", que viram 1º de janeiro e expiram a campanha meses
+    // antes, sem erro nenhum.
+    throw new Error(`data em formato não reconhecido: ${v} (use AAAA-MM-DD, AAAA-MM-DDTHH:MM, ou ISO com fuso)`);
   }
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) throw new Error(`data inválida: ${v}`);
@@ -949,7 +979,7 @@ function pinTuple(r, now) {
   return [brand, slot, tipo, key, offerSku, field, value,
     semSeparador(pinScope(r.surface), 'surface'),
     semSeparador(pinScope(r.goal), 'goal'),
-    Math.round(Number(r.priority) || 0),
+    pinPriority(r.priority),
     pinActive(r.active),
     pinInstant(r.starts_at, 'inicio'),
     pinInstant(r.ends_at, 'fim'),
@@ -1068,7 +1098,7 @@ const PIN_EDITAVEL = {
   },
   surface: (v) => semSeparador(pinScope(v), 'surface'),
   goal: (v) => semSeparador(pinScope(v), 'goal'),
-  priority: (v) => Math.round(Number(v) || 0),
+  priority: pinPriority,
   // NÃO é o `pinActive` da criação. Lá, ausente vale 1 — é o default de uma
   // regra nova. Aqui, `""` ou `null` é o que um formulário manda quando o campo
   // não foi tocado, e cair no default de 1 REATIVA uma regra pausada em
@@ -1133,6 +1163,15 @@ async function handleSetPin(request, db) {
       'SELECT * FROM pin_rule WHERE brand=? AND slot=? AND trigger_type=? AND trigger_key=?',
       [tuple[0], tuple[1], tuple[2], tuple[3]],
     ))[0];
+  }
+
+  // A regra pode ter sumido entre a escrita e a releitura — outra aba no
+  // /pins/delete, ou um /curate/reset. Sem esta guarda, `row.brand` estoura um
+  // TypeError que o catch do topo devolve como 500 COM stack, e o operador
+  // recebe um rastro de pilha em vez de uma resposta. O 404 do delete existe
+  // pela mesma razão: desfecho ambíguo aqui é justamente o que não pode haver.
+  if (!row) {
+    return json({ error: 'rule_vanished', detail: 'a regra foi removida durante a escrita' }, 409);
   }
 
   // Não recusar SKU fora do catálogo: a ordem de carga não é garantida e a

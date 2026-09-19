@@ -1,6 +1,8 @@
 # Contrato do offer-api
 
 **Base:** `https://offer-api.devgogroup.com` · app GoDeploy `ed10c7cb`, público
+**Sem bearer:** `POST /recommend`, `POST /event`, `GET /health`, `GET /config`.
+Todo o resto — inclusive `/offers`, `/log` e `/pins` — exige `CURATE_TOKEN`.
 **Marcas:** `barbours`, `rituaria`
 
 O app não lê as bases do grupo. O dado é **empurrado** para ele via `/curate/*`
@@ -97,10 +99,19 @@ feature inerte enquanto ninguém cria regra.
 
 `pins` no `/recommend` traz **só as regras que de fato ocuparam uma vaga**. As que
 não colaram carregam o SKU que a marca queria empurrar e o código interno que o
-barrou — num endpoint público isso é o plano de merchandising e o estado do
-estoque a céu aberto. Para diagnóstico use `debug: true`, o `/offers` ou o
-`/log`; o tema não precisa, porque cada oferta já diz `pinned`, `slot` e
+barrou — e esta rota é pública. Para diagnóstico use `debug: true`, o `/offers`
+ou o `/log`; o tema não precisa, porque cada oferta já diz `pinned`, `slot` e
 `pin_rule`.
+
+> **`/offers`, `/log` e `/pins` passaram a exigir bearer.** Eram abertas, e não
+> dava para sustentar: `/log` devolvia a margem esperada por produto, o preço, o
+> score e o carrinho de shoppers reais para qualquer um na internet, e as três
+> passaram a carregar o relatório de curadoria. Filtrar o `/recommend` com
+> cuidado era teatro enquanto um GET vizinho entregava tudo.
+>
+> A loja **não** é afetada: o tema chama só `POST /recommend` e `POST /event`,
+> que seguem públicos, e o `/health` também. Quem lê diagnóstico é você pelo
+> terminal e o painel, que proxia com o token no servidor.
 
 **Sem oferta válida:** HTTP 200 com `offers: []` e `reason` explicando
 (ex.: `"sem oferta: over_price_cap=73, kit_contains_cart_sku=14"`).
@@ -302,9 +313,12 @@ que não reconhece, em vez de assumir "pausada" em silêncio.
 ### Por que uma regra não apareceu
 
 `GET /offers` devolve sempre `pins_discarded`, com o motivo de cada regra que
-existe e não agiu: `pausada`, `expirada`, `ainda_nao_comecou`, `gatilho_nao_casou`,
-`outra_superficie`, `outro_goal`, `slot_fora_do_alcance`,
-`produto_ja_fixado_em_vaga_menor`. No `/recommend` isso só sai com `debug: true` —
+existe e não agiu, em ordem de precedência da checagem: `slot_invalido`,
+`sem_vagas`, `pausada`, `expirada`, `ainda_nao_comecou`, `outra_superficie`,
+`outro_goal`, `sem_offer_sku`, `gatilho_nao_casou`, `slot_fora_do_alcance`,
+`vaga_tomada_por_regra_mais_especifica`, `produto_ja_fixado_em_vaga_menor`.
+A vaga é a **última** checagem de propósito: uma regra pausada na vaga 5 relatada
+como "fora do alcance" faria o operador aumentar o `n` do tema para nada. No `/recommend` isso só sai com `debug: true` —
 no carrinho seria uma lista por regra pausada em toda requisição.
 
 > **Simule com o mesmo `n` da loja.** O `/offers` usa `n=10` por padrão e o tema

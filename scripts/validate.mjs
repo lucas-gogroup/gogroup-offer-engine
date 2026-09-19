@@ -11,6 +11,13 @@ const env = (k) => {
   return m ? m[1].trim() : undefined;
 };
 const API = process.env.OFFER_API || env('OFFER_API');
+// /offers e /log passaram a exigir bearer: devolvem margem por produto, score e
+// carrinho de shoppers reais, e não podiam seguir abertas.
+const TOKEN = process.env.CURATE_TOKEN || env('CURATE_TOKEN');
+if (!TOKEN) {
+  console.error('CURATE_TOKEN ausente: o checklist lê /offers e /log, que agora exigem bearer.');
+  process.exit(1);
+}
 
 const results = [];
 const check = (name, ok, detail = '') => {
@@ -22,7 +29,9 @@ const warn = (name, ok, detail = '') => {
   console.log(`${ok ? '  OK  ' : ' AVISO'} ${name}${detail ? ` — ${detail}` : ''}`);
 };
 
-const get = async (p) => (await fetch(`${API}${p}`)).json();
+const get = async (p) => (await fetch(`${API}${p}`, {
+  headers: { Authorization: `Bearer ${TOKEN}` },
+})).json();
 const post = async (p, body) => (await fetch(`${API}${p}`, {
   method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
 })).json();

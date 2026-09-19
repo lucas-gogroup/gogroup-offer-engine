@@ -608,3 +608,34 @@ test('sem vaga renderizada, nenhuma regra ganha dispensa de filtro', () => {
   assert.deepEqual(pins, []);
   assert.equal(pinsDiscarded[0].why, 'sem_vagas');
 });
+
+test('vice assume a vaga quando a vencedora cai por produto duplicado', () => {
+  // Vaga 1 fixa X. Na vaga 3, a regra por SKU também aponta X (e perde por
+  // duplicidade) e a regra "sempre" aponta Y. Antes, as duas eram descartadas e
+  // a vaga 3 ficava órfã — com o operador lendo "vaga já tomada", que era falso.
+  const cartProds = [prod({ sku: 'A' })];
+  const base = { cartSkus: new Set(['A']), cartProds, slots: 3, now: AGORA };
+  const r = resolvePins([
+    rule({ slot: 1, trigger_type: 'always', trigger_key: '', offer_sku: 'X' }),
+    rule({ slot: 3, trigger_type: 'sku', trigger_key: 'A', offer_sku: 'X' }),
+    rule({ slot: 3, trigger_type: 'always', trigger_key: '', offer_sku: 'Y' }),
+  ], base);
+
+  assert.equal(r.bySlot.get(1).offer_sku, 'X');
+  assert.equal(r.bySlot.get(3).offer_sku, 'Y', 'a vice assumiu');
+  assert.deepEqual([...r.pinnedSkus].sort(), ['X', 'Y']);
+  const motivos = r.discarded.map((d) => d.why);
+  assert.deepEqual(motivos, ['produto_ja_fixado_em_vaga_menor']);
+});
+
+test('quem perde a disputa é relatado como vaga tomada, e só isso', () => {
+  const cartProds = [prod({ sku: 'A' })];
+  const base = { cartSkus: new Set(['A']), cartProds, slots: 3, now: AGORA };
+  const r = resolvePins([
+    rule({ slot: 1, trigger_type: 'sku', trigger_key: 'A', offer_sku: 'VENCE' }),
+    rule({ slot: 1, trigger_type: 'always', trigger_key: '', offer_sku: 'PERDE' }),
+  ], base);
+  assert.equal(r.bySlot.get(1).offer_sku, 'VENCE');
+  assert.equal(r.discarded[0].why, 'vaga_tomada_por_regra_mais_especifica');
+  assert.equal(r.discarded[0].offer_sku, 'PERDE');
+});
