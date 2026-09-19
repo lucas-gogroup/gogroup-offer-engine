@@ -83,10 +83,17 @@ no número e o `label` no texto.
   "copy": "Quem levou esse também levou ...",
   "reason": "preço cheio; margem 73%",
   "ttl_seconds": 900,
+  "slot": 1,                     // só quando há curadoria — ver GET /pins
+  "pinned": false,               // true = esta oferta veio de regra humana
+  "pin_rule": null,              // "1|sku|RT01008" quando pinned
   "context": { "anchor": "RT01008", "cart_total": 89.9, "gap": 0, "threshold_label": null, ... },
   "latency_ms": 307
 }
 ```
+
+**Sem nenhuma regra de curadoria ativa, `slot`, `pinned`, `pin_rule` e `pins` não
+aparecem** — o payload é byte a byte o de sempre. É o que torna o deploy desta
+feature inerte enquanto ninguém cria regra.
 
 **Sem oferta válida:** HTTP 200 com `offers: []` e `reason` explicando
 (ex.: `"sem oferta: over_price_cap=73, kit_contains_cart_sku=14"`).
@@ -138,6 +145,22 @@ Realimenta o bandit **no próprio request** — sem cron, sem janela de 15 min.
 `reject` é registrado no log mas não mexe em contador: recusa já está implícita
 em `impressions − accepts`, e contar de novo seria contar duas vezes.
 
+### Oferta curada vai para um braço separado
+
+Evento sobre uma oferta que saiu por curadoria é contabilizado em
+`offer_stats` com `segment` igual a `<segmento>|pin`. O `/recommend` liga o
+`segment` cru do request, então **essas linhas nunca voltam para o amostrador**.
+
+Não é higiene. O pin injeta exposição forçada, quase sempre na vaga 1, que
+converte melhor por **posição** e não por mérito. Misturado, um pin de 30 dias
+deixaria a posterior daquele braço tão dominante que o bandit continuaria
+escolhendo o mesmo SKU depois de a regra expirar — o pin sobreviveria à própria
+expiração, e desligar a curadoria não mudaria nada.
+
+O braço `|pin` continua sendo gravado porque é o que permite defender ou matar
+uma regra com número: *"este pin converte a 4,2% em 1.800 impressões; o orgânico
+da mesma âncora roda a 11,1%"*.
+
 ---
 
 ## `GET /offers?brand=&anchor=`
@@ -151,10 +174,92 @@ Simulação: o ranking de uma âncora sem montar carrinho.
 | `n` | 10 | até 50 |
 | `gap`, `max_discount` | — | |
 | `gifts` | — | SKUs separados por vírgula |
+| `cart` | — | SKUs separados por vírgula: monta carrinho de teste com vários itens |
+| `no_pins` | 0 | `1` ignora a curadoria — o ranking do motor puro |
 | `debug` | 0 | `1` traz a lista de rejeitados com motivo |
 
 O carrinho simulado é a própria âncora pelo preço real do catálogo — então o
-teto de 60% se aplica sobre ele.
+teto de 60% se aplica sobre ele. Com `cart`, os SKUs extras entram pelo preço do
+catálogo; SKU desconhecido entra a zero e não distorce o total.
+
+Como a âncora é o item de maior valor, `cart` pode trocá-la — a resposta traz
+`anchor_effective` além do `anchor` pedido.
+
+Rodar a mesma chamada com e sem `no_pins=1` mostra lado a lado o que a curadoria
+mudou. É a base do simulador do painel.
+
+---
+
+## `GET /pins?brand=` · `POST /pins` (bearer) · `POST /pins/delete` (bearer)
+
+Curadoria manual: fixa um produto numa **vaga** do carrinho. Vaga é a posição na
+lista que o `/recommend` devolve — com `n=3`, o carrinho tem as vagas 1, 2 e 3.
+
+### O que o pin pode e não pode
+
+O pin dispensa **apenas as travas econômicas**: teto de preço, faixa de gap e
+preço mínimo. Ele **não** dispensa, em hipótese nenhuma:
+
+`sku_in_cart` · `kit_contains_cart_sku` · `kit_overlaps_cart_kit` ·
+`component_of_cart_kit` · `sku_is_gift` · `gift_functional_equivalent` ·
+`out_of_stock` · `no_price` · `no_cogs` · `no_variant_id` · `below_margin_floor`
+
+Quando a regra casa mas o produto bate numa dessas, a vaga cai no ranking normal
+e o `pins[]` da resposta diz qual código barrou. Sem isso, quem criou a regra
+veria a oferta "errada" no carrinho sem nenhuma forma de descobrir o motivo.
+
+### Forma da regra
+
+```jsonc
+{
+  "brand": "rituaria",
+  "slot": 1,                       // 1..10
+  "trigger_type": "always | sku | taxonomy",
+  "trigger_sku": "RT01008",        // quando trigger_type=sku
+  "trigger_field": "category | subcategory | line",  // quando taxonomy
+  "trigger_value": "Fórmulas",     // gravado normalizado (acento/caixa)
+  "offer_sku": "KRT99078",         // o produto que ocupa a vaga
+  "surface": "*", "goal": "*",     // escopo; "*" vale para todos
+  "priority": 0,
+  "active": 1,
+  "starts_at": null,
+  "ends_at": "2026-12-31",         // data pura vira o FIM do dia em BRT
+  "note": "campanha de fim de ano"
+}
+```
+
+O gatilho `taxonomy` casa contra o **carrinho inteiro**, não só a âncora.
+
+### Precedência, quando duas regras disputam a mesma vaga
+
+Quanto mais específico o "se", mais forte a regra:
+
+1. `sku` > `taxonomy` > `always`
+2. dentro de `taxonomy`: `subcategory` > `line` > `category`
+3. `priority` maior
+4. `updated_at` mais recente
+5. chave da regra (garante ordem total — o ranking nunca muda sozinho)
+
+`priority` **não** atravessa especificidade: um `always` com prioridade 99
+continua perdendo de um gatilho por SKU. Para inverter, pause a regra mais
+específica. O mesmo produto vencendo em duas vagas ocupa a **menor**.
+
+### Chamadas
+
+`GET /pins?brand=&slot=&active=` — aberto, como `/config` e `/log`. Devolve as
+regras mais o estado calculado: `expired`, `not_started`, `effective` e
+`offer_in_catalog` (avisa regra apontando para SKU que não existe).
+
+`POST /pins` (bearer) — grava **uma** regra. Pausar é `{"active": 0}`, não
+precisa de rota própria. Recusa com `invalid_rule` e um `detail` legível.
+
+`POST /pins/delete` (bearer) — `{brand, slot, trigger_type, trigger_sku}` remove
+uma regra; `{brand, slot}` limpa a vaga inteira. É POST porque o CORS do app só
+libera `GET, POST, OPTIONS`.
+
+`POST /curate/pins` (bearer) — carga em lote, no formato dos outros `/curate`:
+`INSERT OR REPLACE` sobre a chave natural, com `errors[]` por linha. E
+`POST /curate/reset?table=pins&brand=` zera antes de recarregar.
 
 ---
 

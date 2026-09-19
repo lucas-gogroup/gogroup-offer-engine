@@ -716,3 +716,287 @@ test('banco já no formato atual não paga o DDL de novo', async () => {
   await ensureSchema(db, { segunda: true }); // chave nova: força reavaliar
   assert.equal(escritas, 0, 'banco já atual: nenhuma escrita de DDL');
 });
+
+// ---------------------------------------------------------------------------
+// Curadoria manual (pin por vaga) — caminho completo contra o SQLite
+// ---------------------------------------------------------------------------
+
+/** Regra mínima aceita por /curate/pins e por POST /pins. */
+function pinRow(over = {}) {
+  return { brand: 'rituaria', slot: 1, trigger_type: 'always', offer_sku: 'RT02001', ...over };
+}
+
+test('/curate/pins exige bearer e valida linha a linha', async () => {
+  const env = newEnv();
+  await seed(env);
+
+  const semToken = await call(env, 'POST', '/curate/pins', { rows: [pinRow()] });
+  assert.equal(semToken.status, 401);
+
+  const r = await call(env, 'POST', '/curate/pins', {
+    rows: [
+      pinRow(),
+      pinRow({ slot: 99 }),                                   // fora de 1..10
+      pinRow({ trigger_type: 'taxonomy', trigger_field: 'brand', trigger_value: 'x' }),
+      pinRow({ trigger_type: 'taxonomy', trigger_field: 'line', trigger_value: 'Não se aplica' }),
+      pinRow({ trigger_type: 'sku' }),                        // sem trigger_sku
+      pinRow({ slot: 2, offer_sku: '' }),                     // sem offer_sku
+    ],
+  }, true);
+
+  assert.equal(r.status, 200);
+  assert.equal(r.body.applied, 1, 'só a linha boa entra');
+  assert.equal(r.body.errors.length, 5, 'a linha ruim não derruba o lote');
+  assert.match(r.body.errors[0].error, /slot entre 1 e 10/);
+  assert.match(r.body.errors[2].error, /trigger_value vazio/);
+});
+
+test('o produto fixado ocupa a vaga 1 e fura o teto de preço', async () => {
+  const env = newEnv();
+  await seed(env);
+
+  // Carrinho de R$ 79,90: o teto é max(0,6 × 79,90; 60) = 60, e o Magnésio
+  // custa 89,90 — sem curadoria ele é barrado por over_price_cap.
+  const carrinho = {
+    brand: 'rituaria', n: 3, cart_total: 79.90,
+    cart: [{ sku: 'RT01015', qty: 1, price: 79.90 }],
+  };
+
+  const antes = await call(env, 'POST', '/recommend', { ...carrinho, debug: true });
+  assert.ok(!(antes.body.offers || []).some((o) => o.sku === 'RT01008'));
+  assert.ok(antes.body.rejected.some((r) => r.sku === 'RT01008' && r.code === 'over_price_cap'));
+  assert.equal(antes.body.pins, undefined, 'sem regra, nem o campo aparece');
+
+  await call(env, 'POST', '/curate/pins', {
+    rows: [pinRow({ slot: 1, offer_sku: 'RT01008' })],
+  }, true);
+
+  const depois = await call(env, 'POST', '/recommend', carrinho);
+  assert.equal(depois.body.sku, 'RT01008', 'o topo achatado é o fixado');
+  assert.equal(depois.body.offers[0].sku, 'RT01008');
+  assert.equal(depois.body.offers[0].slot, 1);
+  assert.equal(depois.body.offers[0].pinned, true);
+  assert.equal(depois.body.offers[0].pin_rule, '1|always|');
+  assert.equal(depois.body.pins[0].applied, true);
+});
+
+test('gatilho por SKU só dispara no carrinho que o contém', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [pinRow({ slot: 1, trigger_type: 'sku', trigger_sku: 'RT01008', offer_sku: 'RT02001' })],
+  }, true);
+
+  const comGatilho = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', n: 3, cart_total: 89.90,
+    cart: [{ sku: 'RT01008', qty: 1, price: 89.90 }],
+  });
+  assert.equal(comGatilho.body.offers[0].sku, 'RT02001');
+  assert.equal(comGatilho.body.offers[0].pinned, true);
+
+  const semGatilho = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', n: 3, cart_total: 79.90,
+    cart: [{ sku: 'RT01015', qty: 1, price: 79.90 }],
+  });
+  assert.equal(semGatilho.body.pins, undefined, 'gatilho não casou: curadoria inerte');
+  assert.ok(!(semGatilho.body.offers || []).some((o) => o.pinned));
+});
+
+test('pin barrado por integridade deixa rastro no log', async () => {
+  const env = newEnv();
+  await seed(env);
+  // KRT99078 contém RT01015: a trava de integridade tem que vencer a curadoria.
+  await call(env, 'POST', '/curate/pins', {
+    rows: [pinRow({ slot: 1, offer_sku: 'KRT99078' })],
+  }, true);
+
+  const { body } = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', n: 3, cart_total: 79.90,
+    cart: [{ sku: 'RT01015', qty: 1, price: 79.90 }],
+  });
+  assert.ok(!(body.offers || []).some((o) => o.sku === 'KRT99078'));
+  assert.equal(body.pins[0].applied, false);
+  assert.equal(body.pins[0].fallback_reason, 'kit_contains_cart_sku');
+
+  const log = await call(env, 'GET', '/log?brand=rituaria&limit=1');
+  const pins = log.body.entries[0].decision.pins;
+  assert.equal(pins[0].applied, false);
+  assert.equal(pins[0].fallback_reason, 'kit_contains_cart_sku');
+});
+
+test('evento de oferta fixada vai para o braço |pin e não contamina o orgânico', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [pinRow({ slot: 1, offer_sku: 'RT01008' })],
+  }, true);
+
+  const rec = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', n: 3, cart_total: 79.90,
+    cart: [{ sku: 'RT01015', qty: 1, price: 79.90 }],
+  });
+  assert.equal(rec.body.sku, 'RT01008');
+
+  await call(env, 'POST', '/event', { offer_id: rec.body.offer_id, event: 'impression' });
+  await call(env, 'POST', '/event', { offer_id: rec.body.offer_id, event: 'accept' });
+
+  const linhas = env.DB.prepare(
+    'SELECT segment, impressions, accepts FROM offer_stats WHERE offer_sku = ?',
+  ).all('RT01008');
+  assert.equal(linhas.length, 1);
+  assert.equal(linhas[0].segment, 'new|pin', 'o braço do pin é separado');
+  assert.equal(linhas[0].accepts, 1);
+
+  const organico = env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM offer_stats WHERE segment = 'new'",
+  ).all()[0].n;
+  assert.equal(organico, 0, 'nada foi escrito no braço orgânico');
+});
+
+test('/pins lista com estado calculado e avisa SKU fora do catálogo', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [
+      pinRow({ slot: 1, offer_sku: 'RT02001', ends_at: '2020-01-01' }),
+      pinRow({ slot: 2, offer_sku: 'RT01008' }),
+      pinRow({ slot: 3, offer_sku: 'FANTASMA' }),
+    ],
+  }, true);
+
+  const { body } = await call(env, 'GET', '/pins?brand=rituaria');
+  assert.equal(body.count, 3);
+  const porSlot = Object.fromEntries(body.rules.map((r) => [r.slot, r]));
+  assert.equal(porSlot[1].expired, true);
+  assert.equal(porSlot[1].effective, false);
+  assert.equal(porSlot[2].effective, true);
+  assert.equal(porSlot[2].offer_in_catalog, true);
+  assert.equal(porSlot[3].offer_in_catalog, false, 'SKU fantasma é sinalizado');
+});
+
+test('POST /pins recusa regra inválida com motivo legível, e grava a válida', async () => {
+  const env = newEnv();
+  await seed(env);
+
+  const ruim = await call(env, 'POST', '/pins', pinRow({ slot: 0 }), true);
+  assert.equal(ruim.status, 400);
+  assert.equal(ruim.body.error, 'invalid_rule');
+  assert.match(ruim.body.detail, /slot entre 1 e 10/);
+
+  const bom = await call(env, 'POST', '/pins',
+    pinRow({ slot: 2, offer_sku: 'RT02001', ends_at: '2026-12-31', note: 'campanha' }), true);
+  assert.equal(bom.status, 200);
+  assert.equal(bom.body.stored.note, 'campanha');
+  assert.deepEqual(bom.body.warnings, []);
+
+  // Data pura vira o FIM do dia em BRT: 31/12 termina às 02:59:59.999Z de 01/01.
+  assert.equal(bom.body.stored.ends_at, '2027-01-01T02:59:59.999Z');
+
+  const fantasma = await call(env, 'POST', '/pins',
+    pinRow({ slot: 3, offer_sku: 'NAO_EXISTE' }), true);
+  assert.equal(fantasma.body.warnings.length, 1);
+  assert.match(fantasma.body.warnings[0], /não está no catálogo/);
+});
+
+test('POST /pins/delete remove por vaga e por chave natural', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [
+      pinRow({ slot: 1, trigger_type: 'sku', trigger_sku: 'RT01008', offer_sku: 'RT02001' }),
+      pinRow({ slot: 1, trigger_type: 'always', offer_sku: 'RT01015' }),
+      pinRow({ slot: 2, offer_sku: 'RT02001' }),
+    ],
+  }, true);
+
+  const semToken = await call(env, 'POST', '/pins/delete', { brand: 'rituaria', slot: 2 });
+  assert.equal(semToken.status, 401);
+
+  const umaRegra = await call(env, 'POST', '/pins/delete',
+    { brand: 'rituaria', slot: 1, trigger_type: 'sku', trigger_sku: 'RT01008' }, true);
+  assert.equal(umaRegra.body.remaining, 2);
+
+  const vagaInteira = await call(env, 'POST', '/pins/delete', { brand: 'rituaria', slot: 1 }, true);
+  assert.equal(vagaInteira.body.remaining, 1);
+});
+
+test('curadoria de uma marca não vaza para a outra', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [pinRow({ brand: 'barbours', slot: 1, offer_sku: 'BRB-HID-50' })],
+  }, true);
+
+  const rituaria = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', n: 3, cart_total: 79.90,
+    cart: [{ sku: 'RT01015', qty: 1, price: 79.90 }],
+  });
+  assert.equal(rituaria.body.pins, undefined);
+  assert.ok(!(rituaria.body.offers || []).some((o) => o.sku === 'BRB-HID-50'));
+
+  const barbours = await call(env, 'POST', '/recommend', {
+    brand: 'barbours', n: 3, cart_total: 129.90,
+    cart: [{ sku: 'BRB-SER-30', qty: 1, price: 129.90 }],
+  });
+  assert.equal(barbours.body.offers[0].sku, 'BRB-HID-50');
+  assert.equal(barbours.body.offers[0].pinned, true);
+});
+
+test('/curate/reset?table=pins apaga só a marca pedida', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [
+      pinRow({ brand: 'rituaria', slot: 1, offer_sku: 'RT02001' }),
+      pinRow({ brand: 'barbours', slot: 1, offer_sku: 'BRB-HID-50' }),
+    ],
+  }, true);
+
+  const r = await call(env, 'POST', '/curate/reset?table=pins&brand=rituaria', undefined, true);
+  assert.equal(r.body.table, 'pin_rule');
+  assert.equal(r.body.remaining, 1, 'a barbours continua de pé');
+});
+
+test('/offers simula com carrinho de vários itens e compara com e sem curadoria', async () => {
+  const env = newEnv();
+  await seed(env);
+  // Gatilho taxonômico: só casa porque o gatilho olha o carrinho INTEIRO.
+  await call(env, 'POST', '/curate/pins', {
+    rows: [pinRow({
+      slot: 1, trigger_type: 'taxonomy', trigger_field: 'line',
+      trigger_value: 'BELEZA', offer_sku: 'RT01008',
+    })],
+  }, true);
+
+  const semCarrinho = await call(env, 'GET', '/offers?brand=rituaria&anchor=RT01015&n=3');
+  assert.deepEqual(semCarrinho.body.pins, [], 'sem o item de beleza, a regra não casa');
+
+  const comCarrinho = await call(env, 'GET', '/offers?brand=rituaria&anchor=RT01015&cart=RT02001&n=3');
+  assert.deepEqual(comCarrinho.body.cart_skus, ['RT01015', 'RT02001']);
+  assert.equal(comCarrinho.body.pins[0].applied, true);
+  assert.equal(comCarrinho.body.offers[0].sku, 'RT01008');
+
+  const cru = await call(env, 'GET', '/offers?brand=rituaria&anchor=RT01015&cart=RT02001&n=3&no_pins=1');
+  assert.deepEqual(cru.body.pins, [], 'no_pins devolve o ranking do motor puro');
+  assert.ok(!cru.body.offers.some((o) => o.pinned));
+});
+
+test('banco que já existia sem pin_rule ganha a tabela sozinho', async () => {
+  // Espelha o env.DB em produção: criado antes desta feature existir.
+  const db = new DatabaseSync(':memory:');
+  db.exec(`CREATE TABLE product (
+    brand TEXT NOT NULL, sku TEXT NOT NULL, variant_id TEXT, product_id TEXT,
+    title TEXT, is_kit INTEGER NOT NULL DEFAULT 0, category TEXT, subcategory TEXT,
+    line TEXT, price REAL, cogs REAL, cost_provisional INTEGER DEFAULT 0,
+    margin_ref REAL, image_url TEXT, url TEXT, available INTEGER, coverage_days REAL,
+    stock_status TEXT, source TEXT, loaded_at TEXT, confidence TEXT,
+    PRIMARY KEY (brand, sku))`);
+  const env = { DB: db, CURATE_TOKEN: TOKEN };
+
+  const r = await call(env, 'POST', '/curate/pins', { rows: [pinRow()] }, true);
+  assert.equal(r.body.applied, 1, 'a tabela nasce na primeira chamada');
+  assert.deepEqual(r.body.errors, []);
+
+  const health = await call(env, 'GET', '/health');
+  assert.equal(health.body.counts.pin_rule, 1);
+});

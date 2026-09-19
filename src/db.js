@@ -75,6 +75,43 @@ CREATE TABLE IF NOT EXISTS brand_config (
   low_stock_units REAL, collectible_categories TEXT, line_labels TEXT,
   updated_at TEXT
 );
+
+-- Curadoria manual: fixa um produto numa VAGA do carrinho (o /recommend devolve
+-- N ofertas; a vaga é a posição). Uma tabela para os três gatilhos, porque eles
+-- diferem só em QUAIS colunas estão preenchidas — slot, produto, validade e
+-- precedência são idênticos — e a precedência é justamente ENTRE tipos de
+-- gatilho, o que duas tabelas obrigariam a resolver por UNION.
+--
+-- trigger_type é discriminador EXPLÍCITO, não "os campos de gatilho estão
+-- NULL": um NULL acidental num gatilho de SKU viraria, em silêncio, um pin
+-- incondicional para a marca inteira — o pior erro possível nesta feature.
+--
+-- trigger_key é a parte do gatilho que entra na chave primária:
+--   always   -> string vazia
+--   sku      -> o SKU do gatilho
+--   taxonomy -> campo=valor normalizado
+-- Materializada no mapper, não GENERATED: o repo roda em dois drivers e coluna
+-- gerada exige SQLite 3.31+.
+CREATE TABLE IF NOT EXISTS pin_rule (
+  brand TEXT NOT NULL,
+  slot INTEGER NOT NULL,
+  trigger_type TEXT NOT NULL,
+  trigger_key TEXT NOT NULL,
+  offer_sku TEXT NOT NULL,
+  trigger_field TEXT,
+  trigger_value TEXT,
+  surface TEXT NOT NULL DEFAULT '*',
+  goal TEXT NOT NULL DEFAULT '*',
+  priority INTEGER NOT NULL DEFAULT 0,
+  active INTEGER NOT NULL DEFAULT 1,
+  starts_at TEXT,
+  ends_at TEXT,
+  note TEXT,
+  created_at TEXT,
+  updated_at TEXT,
+  PRIMARY KEY (brand, slot, trigger_type, trigger_key)
+);
+CREATE INDEX IF NOT EXISTS idx_pin_rule_brand ON pin_rule(brand, active);
 `;
 
 /**
@@ -177,20 +214,35 @@ const schemaDone = new WeakMap();
 const SCHEMA_TABLES = [...SCHEMA.matchAll(/CREATE TABLE IF NOT EXISTS (\w+)/g)].map((m) => m[1]);
 
 /**
- * Colunas esperadas em `brand_config`: as do DDL mais as que as migrações
- * acrescentam. Derivado, porque um número cravado aqui envelheceria em silêncio
- * e o motor voltaria a rodar o DDL inteiro a cada request sem ninguém notar.
+ * Colunas esperadas numa tabela: as do DDL mais as que as migrações acrescentam.
+ * Derivado, porque um número cravado aqui envelheceria em silêncio e o motor
+ * voltaria a rodar o DDL inteiro a cada request sem ninguém notar.
+ *
+ * A PK composta é descartada antes de contar: `PRIMARY KEY (brand, slot, ...)`
+ * quebrada por vírgula produziria "PRIMARY", "slot", "trigger_key)" e a
+ * contagem sairia errada — bastando isso para o motor pagar o DDL inteiro em
+ * toda requisição, que é exatamente o que derrubou o app antes.
  */
-const CFG_COLS_ESPERADAS = (() => {
-  const bloco = SCHEMA.match(/CREATE TABLE IF NOT EXISTS brand_config \(([\s\S]*?)\n\);/);
-  const doDdl = bloco
-    ? bloco[1].split(',').map((c) => c.trim().split(/\s+/)[0]).filter(Boolean)
-    : [];
+export function colsEsperadas(tabela) {
+  const bloco = SCHEMA.match(
+    new RegExp(`CREATE TABLE IF NOT EXISTS ${tabela} \\(([\\s\\S]*?)\\n\\);`),
+  );
+  const corpo = bloco
+    ? bloco[1]
+      .replace(/^\s*--.*$/gm, '')
+      .replace(/,?\s*PRIMARY KEY\s*\([^)]*\)/gi, '')
+    : '';
+  const doDdl = corpo.split(',')
+    .map((c) => c.trim().split(/\s+/)[0])
+    .filter((c) => /^\w+$/.test(c));
   const deMigracao = MIGRATIONS
-    .map((m) => m.match(/ALTER TABLE brand_config ADD COLUMN (\w+)/))
+    .map((m) => m.match(new RegExp(`ALTER TABLE ${tabela} ADD COLUMN (\\w+)`)))
     .filter(Boolean).map((m) => m[1]);
   return new Set([...doDdl, ...deMigracao]).size;
-})();
+}
+
+const CFG_COLS_ESPERADAS = colsEsperadas('brand_config');
+const PIN_COLS_ESPERADAS = colsEsperadas('pin_rule');
 
 /**
  * O banco já está no formato atual?
@@ -206,12 +258,14 @@ async function schemaAtual(db) {
     const r = await db.all(
       `SELECT (SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (${
         SCHEMA_TABLES.map(() => '?').join(',')})) AS tabelas,
-              (SELECT COUNT(*) FROM pragma_table_info('brand_config')) AS colunas`,
+              (SELECT COUNT(*) FROM pragma_table_info('brand_config')) AS colunas,
+              (SELECT COUNT(*) FROM pragma_table_info('pin_rule'))     AS colunas_pin`,
       SCHEMA_TABLES,
     );
     const row = r && r[0];
     return !!row && Number(row.tabelas) >= SCHEMA_TABLES.length
-        && Number(row.colunas) >= CFG_COLS_ESPERADAS;
+        && Number(row.colunas) >= CFG_COLS_ESPERADAS
+        && Number(row.colunas_pin) >= PIN_COLS_ESPERADAS;
   } catch {
     return false; // banco novo, ou driver sem pragma: cai no caminho completo
   }
