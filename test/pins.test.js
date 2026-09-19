@@ -639,3 +639,23 @@ test('quem perde a disputa é relatado como vaga tomada, e só isso', () => {
   assert.equal(r.discarded[0].why, 'vaga_tomada_por_regra_mais_especifica');
   assert.equal(r.discarded[0].offer_sku, 'PERDE');
 });
+
+test('só fixado no pool não relata faixa de gap relaxada', () => {
+  // A faixa não derrubou ninguém — não havia candidato comum. Dizer que foi
+  // relaxada é relatar no decision_log um afrouxamento que não aconteceu.
+  const fixado = prod({ sku: 'PIN', price: 100, cogs: 25 });
+  const c = ctx({ cartTotal: 200, gap: 30, pinRules: [rule({ slot: 1, offer_sku: 'PIN' })] });
+  const { offers, relaxed } = decide([fixado], c);
+  assert.deepEqual(relaxed, []);
+  assert.equal(offers[0].sku, 'PIN');
+});
+
+test('oferta fixada não promete co-compra que não existe', () => {
+  // A curadoria coloca na vitrine justamente o que ninguém comprou junto ainda.
+  const lancamento = prod({ sku: 'NOVO', title: 'Lançamento sem histórico', price: 250, cogs: 50 });
+  const c = ctx({ cartTotal: 89.90, pinRules: [rule({ slot: 1, offer_sku: 'NOVO' })] });
+  const { offers } = decide([lancamento], c);
+  assert.equal(offers[0].pinned, true);
+  assert.equal(offers[0].copy, 'Leve também Lançamento sem histórico');
+  assert.ok(!/Quem levou esse/.test(offers[0].copy));
+});

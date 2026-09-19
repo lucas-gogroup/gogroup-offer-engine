@@ -1,8 +1,8 @@
 # Contrato do offer-api
 
 **Base:** `https://offer-api.devgogroup.com` · app GoDeploy `ed10c7cb`, público
-**Sem bearer:** `POST /recommend`, `POST /event`, `GET /health`, `GET /config`.
-Todo o resto — inclusive `/offers`, `/log` e `/pins` — exige `CURATE_TOKEN`.
+**Sem bearer:** `POST /recommend`, `POST /event`, `GET /health` — o que a loja usa.
+Todo o resto, inclusive `/offers`, `/log`, `/pins` e `/config`, exige `CURATE_TOKEN`.
 **Marcas:** `barbours`, `rituaria`
 
 O app não lê as bases do grupo. O dado é **empurrado** para ele via `/curate/*`
@@ -99,7 +99,11 @@ feature inerte enquanto ninguém cria regra.
 
 `pins` no `/recommend` traz **só as regras que de fato ocuparam uma vaga**. As que
 não colaram carregam o SKU que a marca queria empurrar e o código interno que o
-barrou — e esta rota é pública. Para diagnóstico use `debug: true`, o `/offers`
+barrou — e esta rota é pública. Isso reduz o que a curadoria acrescenta de
+exposição, mas **não** torna o `/recommend` discreto: o objeto de cada oferta já
+publicava `expected_margin`, `score` e `available` antes desta feature, e segue
+publicando. Fechar isso mexe no contrato que o tema consome e está anotado como
+decisão separada. Para diagnóstico use `debug: true`, o `/offers`
 ou o `/log`; o tema não precisa, porque cada oferta já diz `pinned`, `slot` e
 `pin_rule`.
 
@@ -352,7 +356,7 @@ linha com **contexto, decisão e motivo** — inclusive quando não há oferta.
 
 ---
 
-## `GET /config?brand=` · `POST /config` (bearer)
+## `GET /config?brand=` (bearer) · `POST /config` (bearer)
 
 Pisos e tetos por marca, **em runtime, sem redeploy**.
 

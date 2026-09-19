@@ -463,7 +463,7 @@ export function incentiveLadder(cand, ctx) {
 // Copy determinístico por regra (AI Proxy é roadmap; não bloqueia)
 // ---------------------------------------------------------------------------
 
-export function buildCopy(cand, { anchorProd, gap, incentive, urgency, cfg, lineLabels }) {
+export function buildCopy(cand, { anchorProd, gap, incentive, urgency, cfg, lineLabels, pinned }) {
   const title = cand.title || cand.sku;
   if (incentive.type === 'threshold') {
     const label = incentive.label || 'frete grátis';
@@ -490,6 +490,11 @@ export function buildCopy(cand, { anchorProd, gap, incentive, urgency, cfg, line
   if (urgency >= 1.5 && cand.available != null && cand.available < teto) {
     return `Últimas unidades: ${title}`;
   }
+  // "Quem levou esse também levou" é afirmação sobre outros compradores, e a
+  // curadoria justamente coloca na vitrine produto que ninguém comprou junto
+  // ainda — um lançamento fixado à mão sairia prometendo uma co-compra que não
+  // existe. Quem escolheu foi uma pessoa da marca, não o histórico.
+  if (pinned) return `Leve também ${title}`;
   return `Quem levou esse também levou ${title}`;
 }
 
@@ -874,9 +879,12 @@ export function decide(candidates, ctx) {
       pool = pinnedSkus.size
         ? banded.concat(pool.filter((c) => pinnedSkus.has(c.sku)))
         : banded;
-    } else {
+    } else if (comuns.length) {
       relaxed.push('gap_band');
     }
+    // `comuns` vazio significa que só havia fixado no pool: a faixa não
+    // derrubou ninguém, então dizer que foi relaxada seria relatar no
+    // decision_log um afrouxamento que nunca aconteceu.
   }
 
   // 3) score. O fixado é pontuado como qualquer outro, inclusive contra o piso
@@ -940,6 +948,7 @@ export function decide(candidates, ctx) {
       copy: buildCopy(cand, {
         anchorProd: ctx.anchorProd, gap: ctx.gap, incentive: ladder.incentive,
         urgency, cfg, lineLabels: ctx.lineLabels,
+        pinned: pinnedSkus.has(cand.sku),
       }),
       reason: buildReason([
         ladder.reason,

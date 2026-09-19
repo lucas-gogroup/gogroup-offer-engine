@@ -300,7 +300,7 @@ test('/config muda piso de margem em runtime, sem redeploy', async () => {
   });
   assert.deepEqual(depois.body.offers, [], 'piso de 95% zera o pool');
 
-  const cfg = await call(env, 'GET', '/config?brand=barbours');
+  const cfg = await call(env, 'GET', '/config?brand=barbours', undefined, true);
   assert.equal(cfg.body.effective.margin_floor, 0.95);
 });
 
@@ -667,7 +667,7 @@ test('config aceita os campos novos, inclusive o mapa de rótulos', async () => 
   assert.equal(set.body.effective.stock_urgency_enabled, 0);
   assert.equal(set.body.effective.collectible_categories, 'Fragrances, Fragrancias');
 
-  const got = await call(env, 'GET', '/config?brand=barbours');
+  const got = await call(env, 'GET', '/config?brand=barbours', undefined, true);
   assert.equal(got.body.effective.stock_urgency_enabled, 0);
   assert.equal(JSON.parse(got.body.effective.line_labels)['tropical glow'], 'Tropical Glow');
 });
@@ -747,7 +747,7 @@ test('/curate/pins exige bearer e valida linha a linha', async () => {
   assert.equal(r.status, 200);
   assert.equal(r.body.applied, 1, 'só a linha boa entra');
   assert.equal(r.body.errors.length, 5, 'a linha ruim não derruba o lote');
-  assert.match(r.body.errors[0].error, /slot entre 1 e 10/);
+  assert.match(r.body.errors[0].error, /slot tem que ser inteiro/);
   assert.match(r.body.errors[2].error, /trigger_value vazio/);
 });
 
@@ -889,7 +889,7 @@ test('POST /pins recusa regra inválida com motivo legível, e grava a válida',
   const ruim = await call(env, 'POST', '/pins', pinRow({ slot: 0 }), true);
   assert.equal(ruim.status, 400);
   assert.equal(ruim.body.error, 'invalid_rule');
-  assert.match(ruim.body.detail, /slot entre 1 e 10/);
+  assert.match(ruim.body.detail, /slot tem que ser inteiro/);
 
   const bom = await call(env, 'POST', '/pins',
     pinRow({ slot: 2, offer_sku: 'RT02001', ends_at: '2026-12-31', note: 'campanha' }), true);
@@ -1349,7 +1349,7 @@ test('mudar a vaga avisa que a regra antiga continua no ar', async () => {
   const movida = await call(env, 'POST', '/pins', { ...regra, slot: 2 }, true);
   assert.equal(movida.body.created, true);
   assert.equal(movida.body.warnings.length, 1);
-  assert.match(movida.body.warnings[0], /também existe na vaga 1/);
+  assert.match(movida.body.warnings[0], /já está fixado na vaga 1/);
 
   const rec = await call(env, 'POST', '/recommend', {
     brand: 'rituaria', n: 3, cart_total: 89.90,
@@ -1369,7 +1369,8 @@ test('as rotas de diagnóstico exigem bearer', async () => {
   // /log devolvia margem esperada, preço, score e carrinho de shoppers reais
   // para qualquer um na internet; /offers o mesmo por âncora; /pins o plano de
   // merchandising com o estoque.
-  for (const rota of ['/log?limit=5', '/offers?brand=rituaria&anchor=RT01008', '/pins?brand=rituaria']) {
+  for (const rota of ['/log?limit=5', '/offers?brand=rituaria&anchor=RT01008',
+    '/pins?brand=rituaria', '/config?brand=rituaria']) {
     const aberto = await call(env, 'GET', rota);
     assert.equal(aberto.status, 401, `${rota} não pode responder sem bearer`);
     const fechado = await call(env, 'GET', rota, undefined, true);
@@ -1436,4 +1437,60 @@ test('debug no /recommend só vale com bearer', async () => {
   assert.ok(Array.isArray(comToken.body.rejected));
   assert.ok(comToken.body.pins_discarded.some((d) => d.why === 'pausada'));
   assert.ok(comToken.body.timings);
+});
+
+test('planilha em pt-BR carrega VERDADEIRO e FALSO, não só metade', async () => {
+  const env = newEnv();
+  await seed(env);
+  const r = await call(env, 'POST', '/curate/pins', {
+    rows: [pinRow({ slot: 1, active: 'VERDADEIRO' }), pinRow({ slot: 2, active: 'FALSO' })],
+  }, true);
+  assert.equal(r.body.applied, 2, 'sem FALSO, toda regra pausada era descartada');
+  assert.deepEqual(r.body.errors, []);
+
+  const lista = await call(env, 'GET', '/pins?brand=rituaria', undefined, true);
+  const porSlot = Object.fromEntries(lista.body.rules.map((x) => [x.slot, x.active]));
+  assert.equal(porSlot[1], 1);
+  assert.equal(porSlot[2], 0);
+});
+
+test('linha ruim não derruba o lote com 500', async () => {
+  const env = newEnv();
+  await seed(env);
+  // `sqlLiteral` roda dentro do bulkInsert, FORA do try/catch por linha: um
+  // campo não serializável estourava o lote inteiro com stack.
+  const r = await call(env, 'POST', '/curate/pins', {
+    rows: [pinRow({ slot: 1 }), pinRow({ slot: 2, created_at: { x: 1 } })],
+  }, true);
+  assert.equal(r.status, 200, 'não pode virar 500');
+  assert.equal(r.body.applied, 1);
+  assert.equal(r.body.errors.length, 1);
+  assert.equal(r.body.table_rows, 1);
+});
+
+test('slot fracionário é recusado, não arredondado', async () => {
+  const env = newEnv();
+  await seed(env);
+  const r = await call(env, 'POST', '/curate/pins', { rows: [pinRow({ slot: 1.6 })] }, true);
+  assert.equal(r.body.applied, 0, 'arredondar fixaria numa vaga que ninguém pediu');
+  assert.match(r.body.errors[0].error, /inteiro/);
+
+  const busca = await call(env, 'GET', '/pins?brand=rituaria&slot=2.5', undefined, true);
+  assert.equal(busca.status, 400);
+});
+
+test('produto já fixado numa vaga menor é avisado, qualquer que seja o gatilho', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/pins',
+    { brand: 'rituaria', slot: 1, trigger_type: 'always', offer_sku: 'RT02001' }, true);
+
+  // Gatilho diferente, mesmo produto: a desduplicação do motor é por SKU, então
+  // esta regra nunca vai aparecer — e o aviso antigo só olhava o mesmo gatilho.
+  const nova = await call(env, 'POST', '/pins', {
+    brand: 'rituaria', slot: 2, trigger_type: 'sku', trigger_sku: 'RT01008',
+    offer_sku: 'RT02001',
+  }, true);
+  assert.equal(nova.body.warnings.length, 1);
+  assert.match(nova.body.warnings[0], /nunca vai aparecer/);
 });

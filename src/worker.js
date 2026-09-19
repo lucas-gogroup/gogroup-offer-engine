@@ -75,7 +75,10 @@ async function route(request, url, db, env) {
   // públicos.
   if (p === '/offers' && m === 'GET') return guard(request, env, () => handleOffers(url, db));
   if (p === '/log' && m === 'GET') return guard(request, env, () => handleLog(url, db));
-  if (p === '/config' && m === 'GET') return handleGetConfig(url, db);
+  // `/config` também: devolve `margin_floor`, os tetos de preço, os priors e o
+  // mapa de rótulos internos de linha — a mesma classe de dado econômico que
+  // justificou fechar `/offers` e `/log`. Deixá-lo aberto era a última fresta.
+  if (p === '/config' && m === 'GET') return guard(request, env, () => handleGetConfig(url, db));
   if (p === '/config' && m === 'POST') return guard(request, env, () => handleSetConfig(request, db));
   // Curadoria. A leitura também é fechada: é o plano de merchandising da marca
   // mais o estado do estoque. DELETE seria o verbo certo, mas o CORS do app
@@ -860,8 +863,11 @@ function pinScope(v) {
   return s && s !== '*' ? s : '*';
 }
 
+// Os dois lados têm que espelhar: `VERDADEIRO` sem `FALSO` — que é exatamente o
+// par que um Excel em pt-BR exporta — carregaria as regras no ar e recusaria
+// TODAS as pausadas, deixando no ar justamente o que estava desligado.
 const SIM = new Set(['1', 't', 'true', 'y', 'yes', 's', 'sim', 'v', 'verdadeiro', 'on']);
-const NAO = new Set(['0', 'f', 'false', 'n', 'no', 'nao', 'não', 'off']);
+const NAO = new Set(['0', 'f', 'false', 'n', 'no', 'nao', 'não', 'falso', 'off']);
 
 /**
  * `active` de uma regra: aceita o vocabulário que uma exportação de planilha
@@ -950,9 +956,11 @@ function pinTuple(r, now) {
   const brand = normBrand(r.brand);
   if (!brand) throw new Error('brand obrigatório');
 
-  const slot = Math.round(Number(r.slot));
-  if (!(slot >= 1 && slot <= MAX_SLOT)) {
-    throw new Error(`slot entre 1 e ${MAX_SLOT} obrigatório`);
+  // Inteiro, não arredondado: `slot: 1.6` virando vaga 2 é o motor adivinhando
+  // onde o operador quis fixar. Todo o resto aqui recusa o que não entende.
+  const slot = Number(r.slot);
+  if (!Number.isInteger(slot) || slot < 1 || slot > MAX_SLOT) {
+    throw new Error(`slot tem que ser inteiro entre 1 e ${MAX_SLOT}: ${r.slot}`);
   }
 
   const tipo = String(r.trigger_type ?? '').trim().toLowerCase();
@@ -992,7 +1000,12 @@ function pinTuple(r, now) {
     pinInstant(r.starts_at, 'inicio'),
     pinInstant(r.ends_at, 'fim'),
     r.note != null ? String(r.note) : null,
-    r.created_at ?? now, now];
+    // Validado, não repassado cru: `sqlLiteral` roda DEPOIS, dentro do
+    // `bulkInsert`, fora do try/catch por linha — um `created_at` que não seja
+    // texto derrubava o lote inteiro com 500 e stack, em vez de virar uma
+    // entrada em `errors[]`.
+    r.created_at != null ? pinInstant(r.created_at, 'inicio') : now,
+    now];
 }
 
 /** Chave natural a partir de um corpo de request, para upsert e delete. */
@@ -1017,11 +1030,11 @@ async function handleListPins(url, db) {
     // um `count: 0` tranquilo — dizendo ao operador que a vaga está livre
     // enquanto a regra segue no ar fixando o carrinho.
     const s = Number(slotQ);
-    if (!Number.isFinite(s) || s < 1 || s > MAX_SLOT) {
+    if (!Number.isInteger(s) || s < 1 || s > MAX_SLOT) {
       return json({ error: 'invalid_slot', slot: slotQ }, 400);
     }
     where.push('r.slot = ?');
-    params.push(Math.round(s));
+    params.push(s);
   }
   const activeQ = q.get('active');
   if (activeQ != null && activeQ !== '') {
@@ -1202,15 +1215,21 @@ async function handleSetPin(request, db) {
   // regra e deixa a antiga no ar. Pior: a desduplicação por produto faz a vaga
   // MENOR vencer, então a regra antiga continua mandando e a edição parece não
   // ter surtido efeito nenhum.
+  // Por PRODUTO, não pela regra inteira: a desduplicação do motor é por
+  // `offer_sku`, então qualquer regra de qualquer gatilho numa vaga menor
+  // apontando para o mesmo produto anula esta — e avisar só quando o gatilho
+  // também coincide deixava passar em silêncio o caso mais comum.
   const gemeas = await db.all(
-    `SELECT slot FROM pin_rule
-      WHERE brand=? AND trigger_type=? AND trigger_key=? AND offer_sku=? AND slot<>?
+    `SELECT slot, trigger_type FROM pin_rule
+      WHERE brand=? AND offer_sku=? AND slot<>? AND active=1
       ORDER BY slot`,
-    [row.brand, row.trigger_type, row.trigger_key, row.offer_sku, row.slot],
+    [row.brand, row.offer_sku, row.slot],
   );
-  if (gemeas.length) {
-    const vagas = gemeas.map((g) => g.slot).join(', ');
-    warnings.push(`a mesma regra também existe na vaga ${vagas}; a vaga menor vence, apague a antiga para mover`);
+  const menores = gemeas.filter((g) => g.slot < row.slot);
+  if (menores.length) {
+    warnings.push(`${row.offer_sku} já está fixado na vaga ${menores.map((g) => g.slot).join(', ')}; a vaga menor vence e esta regra nunca vai aparecer`);
+  } else if (gemeas.length) {
+    warnings.push(`${row.offer_sku} também está fixado na vaga ${gemeas.map((g) => g.slot).join(', ')}; esta, por ser menor, é a que vai valer`);
   }
 
   return json({ ok: true, created: !atual, stored: row, warnings });
