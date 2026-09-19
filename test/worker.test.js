@@ -810,14 +810,22 @@ test('pin barrado por integridade deixa rastro no log', async () => {
     rows: [pinRow({ slot: 1, offer_sku: 'KRT99078' })],
   }, true);
 
-  const { body } = await call(env, 'POST', '/recommend', {
+  const carrinho = {
     brand: 'rituaria', n: 3, cart_total: 79.90,
     cart: [{ sku: 'RT01015', qty: 1, price: 79.90 }],
-  });
-  assert.ok(!(body.offers || []).some((o) => o.sku === 'KRT99078'));
-  assert.equal(body.pins[0].applied, false);
-  assert.equal(body.pins[0].fallback_reason, 'kit_contains_cart_sku');
+  };
 
+  const { body } = await call(env, 'POST', '/recommend', carrinho);
+  assert.ok(!(body.offers || []).some((o) => o.sku === 'KRT99078'));
+  // A rota é pública, e a entrada barrada carrega o SKU que a marca queria
+  // empurrar mais o código interno que o barrou. Não sai sem debug.
+  assert.equal(body.pins, undefined);
+
+  const comDebug = await call(env, 'POST', '/recommend', { ...carrinho, debug: true });
+  assert.equal(comDebug.body.pins[0].applied, false);
+  assert.equal(comDebug.body.pins[0].fallback_reason, 'kit_contains_cart_sku');
+
+  // E o rastro fica no log de qualquer jeito, que é onde ele serve.
   const log = await call(env, 'GET', '/log?brand=rituaria&limit=1');
   const pins = log.body.entries[0].decision.pins;
   assert.equal(pins[0].applied, false);
@@ -1274,4 +1282,79 @@ test('/offers?cart= tem teto, como todo o resto do arquivo', async () => {
   const { status, body } = await call(env, 'GET', `/offers?brand=rituaria&anchor=RT01008&cart=${muitos}`);
   assert.equal(status, 200, 'não pode virar 500 com stack');
   assert.ok(body.cart_skus.length <= 31);
+});
+
+test('active vazio numa edição parcial não reativa a regra', async () => {
+  const env = newEnv();
+  await seed(env);
+  const id = { brand: 'rituaria', slot: 1, trigger_type: 'sku', trigger_sku: 'RT01008' };
+  await call(env, 'POST', '/pins', { ...id, offer_sku: 'RT02001' }, true);
+  await call(env, 'POST', '/pins', { ...id, active: 0 }, true);
+
+  // É o que um formulário manda quando o campo não foi tocado. Cair no default
+  // de criação (1) devolveria a oferta pausada para a frente do shopper.
+  for (const vazio of ['', null]) {
+    const r = await call(env, 'POST', '/pins', { ...id, active: vazio, note: 'x' }, true);
+    assert.equal(r.status, 400, `active=${JSON.stringify(vazio)} tem que falhar`);
+    assert.match(r.body.detail, /active vazio/);
+  }
+
+  const lista = await call(env, 'GET', '/pins?brand=rituaria');
+  assert.equal(lista.body.rules[0].active, 0, 'continua pausada');
+});
+
+test('/pins?slot= inválido é recusado, não devolve lista vazia', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', { rows: [pinRow({ slot: 1 })] }, true);
+
+  const r = await call(env, 'GET', '/pins?brand=rituaria&slot=primeira');
+  assert.equal(r.status, 400, 'count:0 diria que a vaga está livre');
+  assert.equal(r.body.error, 'invalid_slot');
+
+  const ok = await call(env, 'GET', '/pins?brand=rituaria&slot=1');
+  assert.equal(ok.body.count, 1);
+});
+
+test('data sem fuso é lida em BRT, não no fuso da máquina que grava', async () => {
+  const env = newEnv();
+  await seed(env);
+  // É o que um input datetime-local manda. Entregue cru ao new Date, o mesmo
+  // texto viraria instantes diferentes no Worker (UTC) e na máquina do operador.
+  const r = await call(env, 'POST', '/pins',
+    pinRow({ slot: 1, ends_at: '2026-12-31T23:59' }), true);
+  assert.equal(r.body.stored.ends_at, '2027-01-01T02:59:00.000Z');
+
+  // Data pura continua valendo o dia inteiro.
+  const dia = await call(env, 'POST', '/pins',
+    pinRow({ slot: 2, ends_at: '2026-12-31' }), true);
+  assert.equal(dia.body.stored.ends_at, '2027-01-01T02:59:59.999Z');
+
+  // Fuso explícito é respeitado como veio.
+  const zulu = await call(env, 'POST', '/pins',
+    pinRow({ slot: 3, ends_at: '2026-12-31T23:59:00.000Z' }), true);
+  assert.equal(zulu.body.stored.ends_at, '2026-12-31T23:59:00.000Z');
+});
+
+test('mudar a vaga avisa que a regra antiga continua no ar', async () => {
+  const env = newEnv();
+  await seed(env);
+  const regra = {
+    brand: 'rituaria', trigger_type: 'sku', trigger_sku: 'RT01008', offer_sku: 'RT02001',
+  };
+  await call(env, 'POST', '/pins', { ...regra, slot: 1 }, true);
+
+  // A vaga faz parte da identidade: isto cria OUTRA regra. E a desduplicação
+  // por produto faz a vaga menor vencer, então a edição pareceria não ter efeito.
+  const movida = await call(env, 'POST', '/pins', { ...regra, slot: 2 }, true);
+  assert.equal(movida.body.created, true);
+  assert.equal(movida.body.warnings.length, 1);
+  assert.match(movida.body.warnings[0], /também existe na vaga 1/);
+
+  const rec = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', n: 3, cart_total: 89.90,
+    cart: [{ sku: 'RT01008', qty: 1, price: 89.90 }],
+  });
+  assert.equal(rec.body.offers[0].sku, 'RT02001');
+  assert.equal(rec.body.offers[0].slot, 1, 'a vaga menor venceu, como o aviso dizia');
 });

@@ -667,7 +667,16 @@ export function resolvePins(rules, ctx) {
   const discarded = [];
   if (!rules || !rules.length) return { bySlot, pinnedSkus, discarded };
 
-  const slots = Number(ctx.slots) || 0;
+  // `assembleSlots` não coloca nada com `n < 1`. Se aqui a regra continuasse
+  // elegível, o produto entraria em `pinnedSkus` e ganharia a dispensa de teto,
+  // de preço mínimo e da faixa de gap — podendo vencer no score — sem nenhum
+  // `pinned` ou `pins` explicando de onde veio a exceção. As duas funções têm
+  // que concordar sobre o que "sem vaga" significa.
+  const slots = Math.floor(Number(ctx.slots) || 0);
+  if (slots < 1) {
+    for (const r of rules) discarded.push({ rule: pinKey(r), why: 'sem_vagas', offer_sku: r.offer_sku ?? null });
+    return { bySlot, pinnedSkus, discarded };
+  }
   const now = ctx.now || new Date().toISOString();
   // O escopo é gravado normalizado, mas `surface` chega cru do request: comparar
   // sem normalizar faz uma regra salva como "PDP" nunca casar com um tema que
@@ -697,7 +706,7 @@ export function resolvePins(rules, ctx) {
     // tema e nada aconteceria — ela estava pausada o tempo todo. Depois de
     // tudo, só sobra este motivo quando ele é de fato o que impede, e aí o
     // `n` no detalhe é a diferença entre o simulador e a loja.
-    if (slots > 0 && slot > slots) {
+    if (slot > slots) {
       discarded.push({
         rule: pinKey(r), why: 'slot_fora_do_alcance', offer_sku: r.offer_sku ?? null,
         detail: `vaga ${slot} > n=${slots}`,

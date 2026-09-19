@@ -140,7 +140,7 @@ async function handleRecommend(request, db) {
       context: out.context,
       relaxed: out.relaxed.length ? out.relaxed : undefined,
       rejected: out.debug ? out.rejected : undefined,
-      pins: out.pins.length ? out.pins : undefined,
+      pins: pinsPublicaveis(out),
       pins_discarded: out.debug && out.pinsDiscarded.length ? out.pinsDiscarded : undefined,
       timings: out.debug ? out.timings : undefined,
       latency_ms: out.latency_ms,
@@ -153,7 +153,7 @@ async function handleRecommend(request, db) {
     ttl_seconds: 900,
     offers: n > 1 ? out.offers : undefined,
     context: out.context,
-    pins: out.pins.length ? out.pins : undefined,
+    pins: pinsPublicaveis(out),
     // O descarte só sai em debug: no carrinho ele seria uma lista por regra
     // pausada ou fora de gatilho em TODA requisição, e o tema não usa.
     pins_discarded: out.debug && out.pinsDiscarded.length ? out.pinsDiscarded : undefined,
@@ -438,6 +438,23 @@ async function runDecision(db, opts) {
 }
 
 function stripDebug(o) { const { _debug, ...rest } = o; return rest; }
+
+/**
+ * O relatório de curadoria que pode sair numa rota pública.
+ *
+ * As entradas `applied: false` são as interessantes para quem opera e as piores
+ * para publicar: trazem o SKU que a marca QUERIA empurrar e o código interno que
+ * o barrou (`below_margin_floor`, `over_price_cap`, `out_of_stock`). Qualquer
+ * shopper enumeraria o plano de merchandising e o estado do estoque.
+ *
+ * O tema não precisa delas: cada oferta já carrega `pinned`, `slot` e
+ * `pin_rule`. Diagnóstico é o `debug: true` e o simulador.
+ */
+function pinsPublicaveis(out) {
+  if (out.debug) return out.pins.length ? out.pins : undefined;
+  const aplicados = out.pins.filter((p) => p.applied);
+  return aplicados.length ? aplicados : undefined;
+}
 
 // Ordem dos campos no `wire` do group_concat. Uma constante só, ao lado da
 // query, porque isto é serialização — não decisão. `char(31)` (unit separator)
@@ -869,10 +886,18 @@ function semSeparador(v, campo) {
 function pinInstant(v, borda) {
   if (v == null || v === '') return null;
   const s = String(v).trim();
-  const puro = /^\d{4}-\d{2}-\d{2}$/.test(s);
-  const iso = puro
-    ? `${s}T${borda === 'fim' ? '23:59:59.999' : '00:00:00.000'}-03:00`
-    : s;
+  let iso;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    iso = `${s}T${borda === 'fim' ? '23:59:59.999' : '00:00:00.000'}-03:00`;
+  } else if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(s)) {
+    // `datetime-local` do HTML manda exatamente isto, sem fuso. Entregue cru ao
+    // `new Date`, seria lido no fuso do HOST — o mesmo texto viraria instantes
+    // diferentes gravado do Worker (UTC) ou da máquina de quem opera (BRT), e
+    // "31/12 23:59" morreria às 20:59 do dia 31. Quem escreve pensa em BRT.
+    iso = `${s.replace(' ', 'T')}-03:00`;
+  } else {
+    iso = s; // já traz Z ou ±HH:MM: o fuso é explícito, respeita-se
+  }
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) throw new Error(`data inválida: ${v}`);
   return d.toISOString();
@@ -948,7 +973,18 @@ async function handleListPins(url, db) {
   const where = [];
   const params = [];
   if (brand) { where.push('r.brand = ?'); params.push(brand); }
-  if (q.get('slot')) { where.push('r.slot = ?'); params.push(Math.round(Number(q.get('slot')))); }
+  const slotQ = q.get('slot');
+  if (slotQ) {
+    // Sem validar, `?slot=primeira` liga NaN, não casa com nada e a resposta é
+    // um `count: 0` tranquilo — dizendo ao operador que a vaga está livre
+    // enquanto a regra segue no ar fixando o carrinho.
+    const s = Number(slotQ);
+    if (!Number.isFinite(s) || s < 1 || s > MAX_SLOT) {
+      return json({ error: 'invalid_slot', slot: slotQ }, 400);
+    }
+    where.push('r.slot = ?');
+    params.push(Math.round(s));
+  }
   const activeQ = q.get('active');
   if (activeQ != null && activeQ !== '') {
     // O mesmo vocabulário da escrita. Com o `truthy` genérico, `?active=sim`
@@ -1033,7 +1069,14 @@ const PIN_EDITAVEL = {
   surface: (v) => semSeparador(pinScope(v), 'surface'),
   goal: (v) => semSeparador(pinScope(v), 'goal'),
   priority: (v) => Math.round(Number(v) || 0),
-  active: pinActive,
+  // NÃO é o `pinActive` da criação. Lá, ausente vale 1 — é o default de uma
+  // regra nova. Aqui, `""` ou `null` é o que um formulário manda quando o campo
+  // não foi tocado, e cair no default de 1 REATIVA uma regra pausada em
+  // silêncio, colocando a oferta de volta na frente do shopper.
+  active: (v) => {
+    if (v === '' || v === null) throw new Error('active vazio: envie 0 ou 1, ou omita o campo');
+    return pinActive(v);
+  },
   starts_at: (v) => pinInstant(v, 'inicio'),
   ends_at: (v) => pinInstant(v, 'fim'),
   note: (v) => (v != null ? String(v) : null),
@@ -1106,6 +1149,21 @@ async function handleSetPin(request, db) {
   }
   if (row.trigger_type === 'sku' && !await noCatalogo(row.trigger_key)) {
     warnings.push(`trigger_sku ${row.trigger_key} não está no catálogo de ${row.brand} — o casamento é exato, confira a grafia`);
+  }
+
+  // A vaga faz parte da identidade, então "mover de vaga" na verdade CRIA outra
+  // regra e deixa a antiga no ar. Pior: a desduplicação por produto faz a vaga
+  // MENOR vencer, então a regra antiga continua mandando e a edição parece não
+  // ter surtido efeito nenhum.
+  const gemeas = await db.all(
+    `SELECT slot FROM pin_rule
+      WHERE brand=? AND trigger_type=? AND trigger_key=? AND offer_sku=? AND slot<>?
+      ORDER BY slot`,
+    [row.brand, row.trigger_type, row.trigger_key, row.offer_sku, row.slot],
+  );
+  if (gemeas.length) {
+    const vagas = gemeas.map((g) => g.slot).join(', ');
+    warnings.push(`a mesma regra também existe na vaga ${vagas}; a vaga menor vence, apague a antiga para mover`);
   }
 
   return json({ ok: true, created: !atual, stored: row, warnings });

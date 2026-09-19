@@ -587,3 +587,24 @@ test('o motivo mais acionável vence no descarte', () => {
   assert.equal(sobra.discarded[0].why, 'slot_fora_do_alcance');
   assert.equal(sobra.discarded[0].detail, 'vaga 5 > n=3');
 });
+
+test('sem vaga renderizada, nenhuma regra ganha dispensa de filtro', () => {
+  // assembleSlots não coloca nada com n < 1. Se resolvePins continuasse achando
+  // a regra elegível, o produto entraria em pinnedSkus e ganharia a dispensa de
+  // teto e de preço mínimo — podendo vencer no score — sem nenhum `pinned` ou
+  // `pins` explicando de onde veio a exceção.
+  const caro = prod({ sku: 'CARO', price: 300, cogs: 60 });
+  const comum = prod({ sku: 'OK', price: 45, cogs: 11 });
+  const c = ctx({
+    cartTotal: 89.90,
+    slots: 0,
+    pinRules: [rule({ slot: 1, offer_sku: 'CARO' })],
+  });
+  const { offers, rejected, pins, pinsDiscarded } = decide([caro, comum], c);
+
+  assert.ok(rejected.some((r) => r.sku === 'CARO' && r.code === 'over_price_cap'),
+    'sem vaga, o teto volta a valer');
+  assert.ok(!offers.some((o) => o.sku === 'CARO'));
+  assert.deepEqual(pins, []);
+  assert.equal(pinsDiscarded[0].why, 'sem_vagas');
+});

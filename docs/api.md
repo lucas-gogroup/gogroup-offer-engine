@@ -95,6 +95,13 @@ no número e o `label` no texto.
 aparecem** — o payload é byte a byte o de sempre. É o que torna o deploy desta
 feature inerte enquanto ninguém cria regra.
 
+`pins` no `/recommend` traz **só as regras que de fato ocuparam uma vaga**. As que
+não colaram carregam o SKU que a marca queria empurrar e o código interno que o
+barrou — num endpoint público isso é o plano de merchandising e o estado do
+estoque a céu aberto. Para diagnóstico use `debug: true`, o `/offers` ou o
+`/log`; o tema não precisa, porque cada oferta já diz `pinned`, `slot` e
+`pin_rule`.
+
 **Sem oferta válida:** HTTP 200 com `offers: []` e `reason` explicando
 (ex.: `"sem oferta: over_price_cap=73, kit_contains_cart_sku=14"`).
 Nesse caso **esconda o bloco** — nunca renderize card vazio.
@@ -227,6 +234,12 @@ veria a oferta "errada" no carrinho sem nenhuma forma de descobrir o motivo.
   "note": "campanha de fim de ano"
 }
 ```
+
+**Fuso das datas.** `2026-12-31` vira o fim do dia em BRT; `2026-12-31T23:59`
+(o que um `datetime-local` manda) também é lido como BRT, e não no fuso da
+máquina que gravou — senão o mesmo texto viraria instantes diferentes vindo do
+Worker ou do computador de quem opera. Com `Z` ou `±HH:MM` explícito, o fuso
+informado é respeitado.
 
 O gatilho `taxonomy` casa contra o **carrinho inteiro**, não só a âncora.
 
