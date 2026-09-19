@@ -59,7 +59,7 @@ async function route(request, url, db, env) {
   const m = request.method;
 
   if (p === '/' || p === '/health') return handleHealth(db);
-  if (p === '/recommend' && m === 'POST') return handleRecommend(request, db);
+  if (p === '/recommend' && m === 'POST') return handleRecommend(request, db, env);
   if (p === '/event' && m === 'POST') return handleEvent(request, db);
   // Rotas de DIAGNÓSTICO, agora atrás do bearer.
   //
@@ -115,11 +115,19 @@ async function handleHealth(db) {
 // /recommend
 // ---------------------------------------------------------------------------
 
-async function handleRecommend(request, db) {
+async function handleRecommend(request, db, env) {
   const t0 = Date.now();
   const body = await readJson(request);
   const brand = normBrand(body.brand);
   if (!brand) return json({ error: 'brand_required' }, 400);
+
+  // `debug` abre a lista de rejeitados, os tempos e o relatório de curadoria
+  // completo — o SKU que a marca quer empurrar e o código que o barrou. Como
+  // esta rota é pública e o campo vem do CORPO, aceitá-lo de qualquer um
+  // devolveria pela porta da frente tudo que fechar /offers e /log tirou da
+  // porta dos fundos. Só vale com o bearer; sem ele é ignorado, e a loja segue
+  // funcionando normalmente.
+  const debug = !!body.debug && autorizado(request, env);
 
   const surface = body.surface || 'cart';
   const goal = ['aov', 'stock', 'margin'].includes(body.goal) ? body.goal : 'aov';
@@ -135,7 +143,7 @@ async function handleRecommend(request, db) {
     threshold: body.threshold ?? null,
     maxDiscount: body.max_discount ?? DEFAULT_CONFIG.max_discount,
     priceTarget: body.price_target ?? null,
-    debug: !!body.debug,
+    debug,
     agent: 'ofertante',
   });
 
@@ -1408,12 +1416,18 @@ async function handleReset(url, db) {
 // infra
 // ---------------------------------------------------------------------------
 
-async function guard(request, env, fn) {
-  const token = env.CURATE_TOKEN;
-  if (!token) return json({ error: 'curate_token_not_configured' }, 503);
+/** O request traz o bearer correto? Sem efeito colateral, para quem só precisa saber. */
+function autorizado(request, env) {
+  const token = env && env.CURATE_TOKEN;
+  if (!token) return false;
   const auth = request.headers.get('Authorization') || '';
   const given = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-  if (!timingSafeEqual(given, token)) return json({ error: 'unauthorized' }, 401);
+  return timingSafeEqual(given, token);
+}
+
+async function guard(request, env, fn) {
+  if (!env || !env.CURATE_TOKEN) return json({ error: 'curate_token_not_configured' }, 503);
+  if (!autorizado(request, env)) return json({ error: 'unauthorized' }, 401);
   return fn();
 }
 

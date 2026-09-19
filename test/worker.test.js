@@ -109,7 +109,7 @@ test('PORTÃO ponta a ponta — carrinho com RT01008 não recebe KRT99078', asyn
     cart: [{ sku: 'RT01008', variant_id: '900001', qty: 1, price: 89.90 }],
     customer: { is_returning: false },
     debug: true,
-  });
+  }, true);
 
   assert.equal(status, 200);
   assert.notEqual(body.sku, 'KRT99078', 'PORTÃO: kit que contém o carrinho não pode ser ofertado');
@@ -510,7 +510,7 @@ test('afinidade sobrevive a carrinho com vários itens (ordem dos binds)', async
     brand: 'rituaria',
     cart: [{ sku: 'RT01008', qty: 1, price: 89.90 }, { sku: 'RT01015', qty: 1, price: 79.90 }],
     debug: true, n: 5,
-  });
+  }, true);
   const colageno = (body.offers || []).find((o) => o.sku === 'RT02001');
   assert.ok(colageno, 'o colágeno tem que estar no ranking');
   assert.equal(colageno._debug.affinity.co, 180, 'co-compra não pode voltar zerada');
@@ -604,7 +604,7 @@ test('PORTÃO 2 — kit no carrinho não oferta o kit vizinho que divide compone
     cart: [{ sku: 'KRT99078', qty: 1, price: 149.90 }],
     cart_total: 900, // alto de propósito: o teto de preço NÃO pode ser o que protege
     debug: true, n: 5,
-  });
+  }, true);
   const byCode = Object.fromEntries(body.rejected.map((r) => [r.sku, r.code]));
   assert.equal(byCode.KRT99079, 'kit_overlaps_cart_kit');
   const detail = body.rejected.find((r) => r.sku === 'KRT99079').detail;
@@ -619,7 +619,7 @@ test('gap de ponto flutuante: 64,90 − 34,90 não pode virar 30.000000000000007
     brand: 'rituaria', cart_total: 34.90,
     threshold: { value: 64.90, label: 'Frete Grátis' },
     debug: true,
-  });
+  }, true);
   assert.equal(r.body.context.gap, 30, 'o gap reportado e o gap usado têm que ser o mesmo número');
 });
 
@@ -647,7 +647,7 @@ test('oferta abaixo do piso de preço não sai, e o log diz por quê', async () 
   const { body } = await call(env, 'POST', '/recommend', {
     brand: 'rituaria', cart: [{ sku: 'RT01008', qty: 1, price: 89.90 }],
     cart_total: 719.20, debug: true, n: 10,
-  });
+  }, true);
   const rej = body.rejected.find((r) => r.sku === 'RT99001');
   assert.equal(rej.code, 'below_min_price');
   assert.ok(!(body.offers || []).some((o) => o.price < 15));
@@ -762,7 +762,7 @@ test('o produto fixado ocupa a vaga 1 e fura o teto de preço', async () => {
     cart: [{ sku: 'RT01015', qty: 1, price: 79.90 }],
   };
 
-  const antes = await call(env, 'POST', '/recommend', { ...carrinho, debug: true });
+  const antes = await call(env, 'POST', '/recommend', { ...carrinho, debug: true }, true);
   assert.ok(!(antes.body.offers || []).some((o) => o.sku === 'RT01008'));
   assert.ok(antes.body.rejected.some((r) => r.sku === 'RT01008' && r.code === 'over_price_cap'));
   assert.equal(antes.body.pins, undefined, 'sem regra, nem o campo aparece');
@@ -821,7 +821,7 @@ test('pin barrado por integridade deixa rastro no log', async () => {
   // empurrar mais o código interno que o barrou. Não sai sem debug.
   assert.equal(body.pins, undefined);
 
-  const comDebug = await call(env, 'POST', '/recommend', { ...carrinho, debug: true });
+  const comDebug = await call(env, 'POST', '/recommend', { ...carrinho, debug: true }, true);
   assert.equal(comDebug.body.pins[0].applied, false);
   assert.equal(comDebug.body.pins[0].fallback_reason, 'kit_contains_cart_sku');
 
@@ -1143,7 +1143,7 @@ test('regra numa vaga além do n da loja aparece como descartada', async () => {
   const loja = await call(env, 'POST', '/recommend', {
     brand: 'rituaria', n: 1, cart_total: 89.90, debug: true,
     cart: [{ sku: 'RT01008', qty: 1, price: 89.90 }],
-  });
+  }, true);
   assert.equal(loja.body.pins, undefined);
   const d = loja.body.pins_discarded.find((x) => x.why === 'slot_fora_do_alcance');
   assert.equal(d.detail, 'vaga 3 > n=1');
@@ -1409,4 +1409,31 @@ test('priority não numérico é recusado, não virado em zero', async () => {
 
   const lista = await call(env, 'GET', '/pins?brand=rituaria', undefined, true);
   assert.equal(lista.body.rules[0].priority, 10, 'string numérica continua valendo');
+});
+
+test('debug no /recommend só vale com bearer', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [pinRow({ slot: 1, offer_sku: 'RT02001', active: 0 })],
+  }, true);
+
+  const corpo = {
+    brand: 'rituaria', n: 3, cart_total: 79.90, debug: true,
+    cart: [{ sku: 'RT01015', qty: 1, price: 79.90 }],
+  };
+
+  // O campo vem do CORPO numa rota pública: aceitá-lo de qualquer um devolveria
+  // pela porta da frente o que fechar /offers e /log tirou da porta dos fundos.
+  const anonimo = await call(env, 'POST', '/recommend', corpo);
+  assert.equal(anonimo.status, 200, 'a loja não pode quebrar por causa disso');
+  assert.equal(anonimo.body.rejected, undefined);
+  assert.equal(anonimo.body.pins_discarded, undefined);
+  assert.equal(anonimo.body.timings, undefined);
+  assert.ok(anonimo.body.sku, 'e a oferta sai normalmente');
+
+  const comToken = await call(env, 'POST', '/recommend', corpo, true);
+  assert.ok(Array.isArray(comToken.body.rejected));
+  assert.ok(comToken.body.pins_discarded.some((d) => d.why === 'pausada'));
+  assert.ok(comToken.body.timings);
 });

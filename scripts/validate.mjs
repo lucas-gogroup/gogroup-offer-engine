@@ -15,7 +15,7 @@ const API = process.env.OFFER_API || env('OFFER_API');
 // carrinho de shoppers reais, e não podiam seguir abertas.
 const TOKEN = process.env.CURATE_TOKEN || env('CURATE_TOKEN');
 if (!TOKEN) {
-  console.error('CURATE_TOKEN ausente: o checklist lê /offers e /log, que agora exigem bearer.');
+  console.error('CURATE_TOKEN ausente: o checklist lê /offers e /log e usa debug no /recommend — tudo atrás do bearer.');
   process.exit(1);
 }
 
@@ -32,8 +32,12 @@ const warn = (name, ok, detail = '') => {
 const get = async (p) => (await fetch(`${API}${p}`, {
   headers: { Authorization: `Bearer ${TOKEN}` },
 })).json();
+// O bearer vai no POST também: `debug: true` no /recommend só é honrado com
+// token, senão qualquer um abriria a lista de rejeitados numa rota pública.
 const post = async (p, body) => (await fetch(`${API}${p}`, {
-  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TOKEN}` },
+  body: JSON.stringify(body),
 })).json();
 
 console.log(`checklist de corte — ${API}\n`);
@@ -104,13 +108,16 @@ for (const brand of ['barbours', 'rituaria']) {
     (cfg.price_cap_ratio ?? 0.6) * cart,
     Math.min(cfg.price_cap_abs ?? 0, (cfg.price_cap_uplift_max ?? 1.5) * cart),
   );
-  const amostra = await get(`/offers?brand=${brand}&anchor=__none__&n=50`);
+  // `no_pins=1`: a varredura mede o MOTOR. A curadoria dispensa teto e piso de
+  // preço por decisão de negócio, então uma regra ativa faria o checklist de
+  // corte acusar como furo o comportamento que ele mesmo documenta.
+  const amostra = await get(`/offers?brand=${brand}&anchor=__none__&n=50&no_pins=1`);
   const pool = amostra.offers || [];
   const skus = pool.map((o) => o.sku).slice(0, 25);
 
   for (const sku of skus) {
     const prod = pool.find((o) => o.sku === sku);
-    const r = await get(`/offers?brand=${brand}&anchor=${encodeURIComponent(sku)}&n=10`);
+    const r = await get(`/offers?brand=${brand}&anchor=${encodeURIComponent(sku)}&n=10&no_pins=1`);
     const cartTotal = prod.price;
     for (const o of r.offers || []) {
       emitidas++;

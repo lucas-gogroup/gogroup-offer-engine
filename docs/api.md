@@ -196,6 +196,11 @@ Simulação: o ranking de uma âncora sem montar carrinho.
 | `no_pins` | 0 | `1` ignora a curadoria — o ranking do motor puro |
 | `debug` | 0 | `1` traz a lista de rejeitados com motivo |
 
+`debug` no `POST /recommend` **só é honrado com o bearer**. O campo vem do corpo
+numa rota pública: aceitá-lo de qualquer um devolveria pela porta da frente a
+lista de rejeitados e o relatório de curadoria que fechar `/offers` e `/log`
+tirou da porta dos fundos. Sem token ele é ignorado, e a loja não sente nada.
+
 O carrinho simulado é a própria âncora pelo preço real do catálogo — então o
 teto de 60% se aplica sobre ele. Com `cart`, os SKUs extras entram pelo preço do
 catálogo; SKU desconhecido entra a zero e não distorce o total.
@@ -270,7 +275,8 @@ específica. O mesmo produto vencendo em duas vagas ocupa a **menor**.
 
 ### Chamadas
 
-`GET /pins?brand=&slot=&active=` — aberto, como `/config` e `/log`. Devolve as
+`GET /pins?brand=&slot=&active=` (bearer) — é o plano de merchandising da marca
+mais o estado do estoque, então não é aberto. Devolve as
 regras mais o estado calculado: `expired`, `not_started`, `effective` e
 `offer_in_catalog` (avisa regra apontando para SKU que não existe). Dentro de
 cada vaga a lista vem **na ordem da disputa**, usando o mesmo comparador do
