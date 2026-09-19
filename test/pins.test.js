@@ -659,3 +659,48 @@ test('oferta fixada não promete co-compra que não existe', () => {
   assert.equal(offers[0].copy, 'Leve também Lançamento sem histórico');
   assert.ok(!/Quem levou esse/.test(offers[0].copy));
 });
+
+test('escopo exato vence o curinga na mesma vaga', () => {
+  // Desde que o escopo entrou na PK, as duas regras coexistem e AMBAS são
+  // elegíveis num request de carrinho. Sem escopo no comparador, quem escreveu
+  // por último ganhava — uma regra curinga nova tomaria a vaga de uma feita sob
+  // medida para o carrinho.
+  const base = { cartSkus: new Set(), cartProds: [], slots: 3, now: AGORA, surface: 'cart', goal: 'aov' };
+  const curinga = rule({ slot: 1, offer_sku: 'CURINGA', surface: '*', goal: '*', updated_at: '2026-09-18T00:00:00.000Z' });
+  const exata = rule({ slot: 1, offer_sku: 'EXATA', surface: 'cart', goal: '*', updated_at: '2026-01-01T00:00:00.000Z' });
+
+  assert.equal(resolvePins([curinga, exata], base).bySlot.get(1).offer_sku, 'EXATA');
+  assert.equal(resolvePins([exata, curinga], base).bySlot.get(1).offer_sku, 'EXATA');
+
+  // E amarrar as duas dimensões é mais específico que amarrar uma.
+  const duas = rule({ slot: 1, offer_sku: 'DUAS', surface: 'cart', goal: 'aov' });
+  assert.equal(resolvePins([exata, duas, curinga], base).bySlot.get(1).offer_sku, 'DUAS');
+});
+
+test('pinKey distingue regras que só diferem no escopo', () => {
+  // Sem isso, as duas apareceriam com a MESMA chave no pins[] e no log, e não
+  // haveria como saber qual agiu.
+  assert.equal(pinKey({ slot: 1, trigger_type: 'always', trigger_key: '' }), '1|always|');
+  assert.equal(pinKey({ slot: 1, trigger_type: 'always', trigger_key: '', surface: '*', goal: '*' }), '1|always|');
+  assert.equal(
+    pinKey({ slot: 1, trigger_type: 'always', trigger_key: '', surface: 'cart', goal: '*' }),
+    '1|always||cart|*',
+  );
+  assert.notEqual(
+    pinKey({ slot: 1, trigger_type: 'always', trigger_key: '', surface: 'cart' }),
+    pinKey({ slot: 1, trigger_type: 'always', trigger_key: '', surface: 'pdp' }),
+  );
+});
+
+test('empate com mesmo updated_at ainda tem ordem total', () => {
+  // Um lote do /curate/pins carimba o MESMO `now` em todas as linhas: sem
+  // escopo na chave, o desempate final empatava e o vencedor caía na ordem do
+  // group_concat, que não tem ORDER BY.
+  const base = { cartSkus: new Set(), cartProds: [], slots: 3, now: AGORA, surface: 'cart', goal: 'aov' };
+  const mesmo = '2026-09-19T00:00:00.000Z';
+  const a = rule({ slot: 1, offer_sku: 'A', surface: 'cart', updated_at: mesmo });
+  const b = rule({ slot: 1, offer_sku: 'B', surface: '*', updated_at: mesmo });
+  assert.notEqual(comparePins(a, b), 0, 'não pode empatar');
+  assert.equal(resolvePins([a, b], base).bySlot.get(1).offer_sku, 'A');
+  assert.equal(resolvePins([b, a], base).bySlot.get(1).offer_sku, 'A');
+});

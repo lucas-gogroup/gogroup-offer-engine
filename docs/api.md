@@ -269,9 +269,10 @@ Quanto mais específico o "se", mais forte a regra:
 
 1. `sku` > `taxonomy` > `always`
 2. dentro de `taxonomy`: `subcategory` > `line` > `category`
-3. `priority` maior
-4. `updated_at` mais recente
-5. chave da regra (garante ordem total — o ranking nunca muda sozinho)
+3. escopo amarrado > curinga (`surface`/`goal` exatos vencem `*`)
+4. `priority` maior
+5. `updated_at` mais recente
+6. chave da regra (garante ordem total — o ranking nunca muda sozinho)
 
 `priority` **não** atravessa especificidade: um `always` com prioridade 99
 continua perdendo de um gatilho por SKU. Para inverter, pause a regra mais
@@ -298,9 +299,12 @@ identidade, sem perder vigência, escopo, prioridade nem nota.
 
 Editáveis desta forma: `offer_sku`, `priority`, `active`, `starts_at`,
 `ends_at`, `note`. **Vaga, gatilho e escopo não**, porque são a identidade —
-mudá-los é criar outra regra e apagar a antiga. `active` e `priority` recusam
-valor vazio: é o que um formulário manda no campo não tocado, e aceitá-lo
-despausaria a regra ou zeraria o desempate em silêncio.
+mudá-los é criar outra regra e apagar a antiga.
+
+`active`, `priority`, `starts_at` e `ends_at` recusam string vazia: é o que um
+formulário manda no campo não tocado, e aceitá-la despausaria a regra, zeraria o
+desempate ou tornaria eterna uma campanha com data de fim, sempre em silêncio.
+Para limpar uma data, mande `null` explícito.
 
 A resposta traz `created` dizendo se foi criação ou edição, e `warnings` quando
 `offer_sku` ou `trigger_sku` não estão no catálogo da marca. O casamento por SKU

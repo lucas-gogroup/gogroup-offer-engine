@@ -586,12 +586,31 @@ export const PIN_SPECIFICITY = { sku: 3, taxonomy: 2, always: 1 };
 export const PIN_FIELD_SPECIFICITY = { subcategory: 3, line: 2, category: 1 };
 export const PIN_TRIGGER_FIELDS = ['category', 'subcategory', 'line'];
 
-/** Chave natural da regra sem a marca — identifica a regra no log e na saída. */
+const lowerField = (v) => String(v ?? '').trim().toLowerCase();
+
+/** Escopo ausente vale para todos. Nunca vazio, para a chave não ter buraco. */
+const escopo = (v) => lowerField(v) || '*';
+
+/**
+ * Chave natural da regra sem a marca — identifica a regra no log e na saída.
+ *
+ * O escopo entra, porque entra na PK: sem ele duas regras diferentes da mesma
+ * vaga (uma do carrinho, outra da PDP) apareceriam com a MESMA chave no
+ * `pins[]`, no `pinsDiscarded[]` e no decision_log, e não haveria como saber
+ * qual delas agiu. Só aparece quando não é o curinga, para o caso comum
+ * continuar legível: `1|always|` em vez de `1|always||*|*`.
+ */
 export function pinKey(r) {
-  return `${r.slot}|${r.trigger_type}|${r.trigger_key ?? ''}`;
+  const base = `${r.slot}|${r.trigger_type}|${r.trigger_key ?? ''}`;
+  const s = escopo(r.surface);
+  const g = escopo(r.goal);
+  return s === '*' && g === '*' ? base : `${base}|${s}|${g}`;
 }
 
-const lowerField = (v) => String(v ?? '').trim().toLowerCase();
+/** Quantas dimensões de escopo a regra amarra. Mais amarrado = mais específico. */
+function scopeSpecificity(r) {
+  return (escopo(r.surface) === '*' ? 0 : 1) + (escopo(r.goal) === '*' ? 0 : 1);
+}
 
 /**
  * Ordem TOTAL e determinística entre regras que disputam a mesma vaga.
@@ -613,6 +632,15 @@ export function comparePins(a, b) {
   const fa = PIN_FIELD_SPECIFICITY[lowerField(a.trigger_field)] || 0;
   const fb = PIN_FIELD_SPECIFICITY[lowerField(b.trigger_field)] || 0;
   if (fa !== fb) return fb - fa;
+
+  // Escopo também é especificidade, e desde que ele entrou na PK as duas regras
+  // convivem: `surface: '*'` e `surface: 'cart'` são linhas distintas e ambas
+  // elegíveis num request de carrinho. Sem este critério, quem escreveu por
+  // último ganhava — uma regra curinga nova tomava a vaga de uma regra feita sob
+  // medida para o carrinho, que é o inverso de "mais específico vence".
+  const ea = scopeSpecificity(a);
+  const eb = scopeSpecificity(b);
+  if (ea !== eb) return eb - ea;
 
   const pa = Number(a.priority) || 0;
   const pb = Number(b.priority) || 0;

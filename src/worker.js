@@ -136,8 +136,12 @@ async function handleRecommend(request, db, env) {
   const goal = ['aov', 'stock', 'margin'].includes(body.goal) ? body.goal : 'aov';
   const segment = body.customer && body.customer.is_returning ? 'returning' : 'new';
   const n = Math.max(1, Math.min(10, Number(body.n) || 1));
-  const cart = Array.isArray(body.cart) ? body.cart : [];
-  const gifts = Array.isArray(body.gifts) ? body.gifts : [];
+  // Teto no carrinho, como o `cart=` do /offers já tinha — e aqui importa mais,
+  // porque esta é a rota ABERTA. Os SKUs do carrinho entram três vezes nos binds
+  // da query única, então ~340 itens já passam do máximo de variáveis do SQLite:
+  // o erro sobe para o catch do topo e o 500 devolve o stack.
+  const cart = (Array.isArray(body.cart) ? body.cart : []).slice(0, MAX_CART_ITENS);
+  const gifts = (Array.isArray(body.gifts) ? body.gifts : []).slice(0, MAX_CART_ITENS);
 
   const out = await runDecision(db, {
     brand, surface, goal, segment, n, cart, gifts,
@@ -769,7 +773,8 @@ const PIN_COLS = ['brand', 'slot', 'trigger_type', 'trigger_key', 'offer_sku',
   'starts_at', 'ends_at', 'note', 'created_at', 'updated_at'];
 
 const MAX_SLOT = 10; // o teto de `n` em /recommend
-const MAX_CART_SIM = 30; // itens do carrinho de teste em /offers?cart=
+const MAX_CART_SIM = 30;    // itens do carrinho de teste em /offers?cart=
+const MAX_CART_ITENS = 100; // itens aceitos do carrinho no /recommend
 
 const SPECS = {
   product: {
@@ -1136,14 +1141,17 @@ async function pinAtual(db, body) {
  * O gatilho e a vaga ficam de fora de propósito: mudá-los muda a identidade da
  * regra, e isso é criar outra — não editar esta.
  */
+function vazioRecusado(campo) {
+  throw new Error(`${campo} vazio: envie null para limpar, ou omita o campo`);
+}
+
 const PIN_EDITAVEL = {
   offer_sku: (v) => {
     const s = semSeparador(v != null ? String(v).trim() : '', 'offer_sku');
     if (!s) throw new Error('offer_sku não pode ficar vazio');
     return s;
   },
-  surface: (v) => semSeparador(pinScope(v), 'surface'),
-  goal: (v) => semSeparador(pinScope(v), 'goal'),
+  // `surface` e `goal` NÃO entram: são identidade, como a vaga e o gatilho.
   // Mesma guarda do `active`, pela mesma razão: um formulário que sempre envia
   // o campo mandaria vazio no campo não tocado, e a prioridade configurada
   // voltaria a 0 — trocando quem vence a vaga, com ok e sem aviso.
@@ -1159,8 +1167,12 @@ const PIN_EDITAVEL = {
     if (v === '' || v === null) throw new Error('active vazio: envie 0 ou 1, ou omita o campo');
     return pinActive(v);
   },
-  starts_at: (v) => pinInstant(v, 'inicio'),
-  ends_at: (v) => pinInstant(v, 'fim'),
+  // `null` limpa a data de propósito; `""` é recusado pela mesma razão do
+  // `active` e do `priority`: é o que um formulário manda no campo não tocado, e
+  // aceitá-lo transformaria uma campanha de 30 dias numa regra eterna — o pin
+  // seguiria furando teto e piso depois da data de fim, com ok e sem aviso.
+  starts_at: (v) => (v === '' ? vazioRecusado('starts_at') : pinInstant(v, 'inicio')),
+  ends_at: (v) => (v === '' ? vazioRecusado('ends_at') : pinInstant(v, 'fim')),
   note: (v) => (v != null ? String(v) : null),
 };
 
@@ -1270,8 +1282,11 @@ async function handleDeletePin(request, db) {
   const brand = normBrand(body.brand);
   if (!brand) return json({ error: 'brand_required' }, 400);
 
-  const slot = body.slot != null && body.slot !== '' ? Math.round(Number(body.slot)) : null;
-  if (slot != null && !(slot >= 1 && slot <= MAX_SLOT)) {
+  // Inteiro aqui também — era o último caminho que arredondava. `slot: 1.6`
+  // apagava TODAS as regras da vaga 2 e respondia ok, que num delete é a forma
+  // mais cara possível de adivinhar.
+  const slot = body.slot != null && body.slot !== '' ? Number(body.slot) : null;
+  if (slot != null && (!Number.isInteger(slot) || slot < 1 || slot > MAX_SLOT)) {
     return json({ error: 'invalid_slot', slot: body.slot }, 400);
   }
 

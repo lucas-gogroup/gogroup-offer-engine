@@ -1571,3 +1571,52 @@ test('o log conta regra APLICADA, não regra que casou', async () => {
   assert.equal(ctx.pin_rules_applied, 0, 'nenhuma oferta curada saiu');
   assert.equal(ctx.pin_rules_barred, 1);
 });
+
+test('delete não arredonda slot', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [pinRow({ slot: 2, offer_sku: 'RT02001' }), pinRow({ slot: 2, trigger_type: 'sku', trigger_sku: 'RT01008', offer_sku: 'RT01015' })],
+  }, true);
+
+  // Arredondar aqui apagava TODAS as regras da vaga 2 e respondia ok.
+  const r = await call(env, 'POST', '/pins/delete', { brand: 'rituaria', slot: 1.6 }, true);
+  assert.equal(r.status, 400);
+  assert.equal(r.body.error, 'invalid_slot');
+
+  const lista = await call(env, 'GET', '/pins?brand=rituaria', undefined, true);
+  assert.equal(lista.body.count, 2, 'nada foi apagado');
+});
+
+test('ends_at vazio numa edição parcial não torna a regra eterna', async () => {
+  const env = newEnv();
+  await seed(env);
+  const id = { brand: 'rituaria', slot: 1, trigger_type: 'sku', trigger_sku: 'RT01008' };
+  await call(env, 'POST', '/pins', { ...id, offer_sku: 'RT02001', ends_at: '2026-10-31' }, true);
+
+  const vazio = await call(env, 'POST', '/pins', { ...id, offer_sku: 'RT01015', ends_at: '' }, true);
+  assert.equal(vazio.status, 400);
+  assert.match(vazio.body.detail, /ends_at vazio/);
+
+  const lista = await call(env, 'GET', '/pins?brand=rituaria', undefined, true);
+  assert.equal(lista.body.rules[0].ends_at, '2026-11-01T02:59:59.999Z', 'a vigência ficou');
+
+  // Limpar continua possível, mas tem que ser explícito.
+  const limpo = await call(env, 'POST', '/pins', { ...id, ends_at: null }, true);
+  assert.equal(limpo.status, 200);
+  assert.equal(limpo.body.stored.ends_at, null);
+});
+
+test('carrinho gigante no /recommend não estoura o limite de binds', async () => {
+  const env = newEnv();
+  await seed(env);
+  // Os SKUs do carrinho entram três vezes nos binds: ~340 itens já passam do
+  // máximo de variáveis do SQLite, e esta é a rota aberta.
+  const cart = Array.from({ length: 600 }, (_, i) => ({ sku: `X${i}`, qty: 1, price: 1 }));
+  cart.push({ sku: 'RT01008', qty: 1, price: 89.90 });
+  const { status, body } = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', cart, cart_total: 689.90, n: 3,
+  });
+  assert.equal(status, 200, 'não pode virar 500 com stack');
+  assert.ok(body.offer_id);
+});
