@@ -669,22 +669,35 @@ export function resolvePins(rules, ctx) {
 
   const slots = Number(ctx.slots) || 0;
   const now = ctx.now || new Date().toISOString();
-  const surface = ctx.surface || 'cart';
-  const goal = ctx.goal || 'aov';
-  const fora = (r, why) => { discarded.push({ rule: pinKey(r), why }); };
+  // O escopo é gravado normalizado, mas `surface` chega cru do request: comparar
+  // sem normalizar faz uma regra salva como "PDP" nunca casar com um tema que
+  // pede "PDP", e ela some sem nenhum sinal.
+  const surface = lowerField(ctx.surface) || 'cart';
+  const goal = lowerField(ctx.goal) || 'aov';
+  const fora = (r, why) => { discarded.push({ rule: pinKey(r), why, offer_sku: r.offer_sku ?? null }); };
 
   const elegiveis = [];
   for (const r of rules) {
     const slot = Number(r.slot);
     if (!Number.isFinite(slot) || slot < 1) { fora(r, 'slot_invalido'); continue; }
     // Vaga além do que o carrinho renderiza não é erro: é regra guardada para
-    // quando o tema mostrar mais ofertas.
-    if (slots > 0 && slot > slots) { fora(r, 'slot_fora_do_alcance'); continue; }
+    // quando o tema mostrar mais ofertas. Mas o descarte vai para o relatório
+    // com o `n` do request — é a diferença entre o simulador (n=10 por padrão)
+    // e a loja, e sem isso a regra "some" sem explicação.
+    if (slots > 0 && slot > slots) {
+      discarded.push({
+        rule: pinKey(r), why: 'slot_fora_do_alcance', offer_sku: r.offer_sku ?? null,
+        detail: `vaga ${slot} > n=${slots}`,
+      });
+      continue;
+    }
     if (Number(r.active) !== 1) { fora(r, 'pausada'); continue; }
     if (r.starts_at && String(r.starts_at) > now) { fora(r, 'ainda_nao_comecou'); continue; }
     if (r.ends_at && String(r.ends_at) < now) { fora(r, 'expirada'); continue; }
-    if (r.surface && r.surface !== '*' && r.surface !== surface) { fora(r, 'outra_superficie'); continue; }
-    if (r.goal && r.goal !== '*' && r.goal !== goal) { fora(r, 'outro_goal'); continue; }
+    const escopoSup = lowerField(r.surface);
+    if (escopoSup && escopoSup !== '*' && escopoSup !== surface) { fora(r, 'outra_superficie'); continue; }
+    const escopoGoal = lowerField(r.goal);
+    if (escopoGoal && escopoGoal !== '*' && escopoGoal !== goal) { fora(r, 'outro_goal'); continue; }
     if (!r.offer_sku) { fora(r, 'sem_offer_sku'); continue; }
     if (!pinTriggerMatches(r, ctx)) { fora(r, 'gatilho_nao_casou'); continue; }
     elegiveis.push(slot === r.slot ? r : { ...r, slot });
@@ -749,6 +762,10 @@ export function assembleSlots(scored, bySlot, rejectedBySku, slots) {
       planejado.set(s, { oferta, base });
     } else {
       const rej = rejectedBySku && rejectedBySku.get(sku);
+      // `produto_ja_fixado_em_outra_vaga` não acontece vindo de `decide`:
+      // `resolvePins` já desduplica antes. É a guarda para quem chama
+      // `assembleSlots` direto com um `bySlot` montado à mão — e está coberta
+      // por teste, para não virar código morto sem ninguém notar.
       pins.push({
         ...base,
         slot: s,
@@ -806,7 +823,7 @@ export function decide(candidates, ctx) {
 
   // 0) curadoria. Quem está fixado precisa ser conhecido ANTES dos filtros
   //    duros, porque o filtro é quem dispensa as travas econômicas.
-  const { bySlot, pinnedSkus } = resolvePins(ctx.pinRules, ctx);
+  const { bySlot, pinnedSkus, discarded } = resolvePins(ctx.pinRules, ctx);
   // Sem pin nenhum o ctx não é nem copiado: o caminho comum segue idêntico.
   const fctx = pinnedSkus.size ? { ...ctx, pinnedSkus } : ctx;
 
@@ -924,7 +941,10 @@ export function decide(candidates, ctx) {
   // 4) montagem das vagas — a curadoria age AQUI, sobre um ranking legítimo.
   const rejectedBySku = new Map(rejected.map((r) => [r.sku, r]));
   const { offers, pins } = assembleSlots(scored, bySlot, rejectedBySku, ctx.slots);
-  return { offers, rejected, relaxed, pins };
+  // `pinsDiscarded` é o outro lado do `pins`: a regra que existe e NÃO agiu.
+  // Mesma justificativa — sem ele, quem criou a regra não tem como saber se ela
+  // está pausada, expirada, fora de escopo ou simplesmente não casou.
+  return { offers, rejected, relaxed, pins, pinsDiscarded: discarded };
 }
 
 // ---------------------------------------------------------------------------

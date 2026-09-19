@@ -502,3 +502,65 @@ test('pinKey é a chave natural sem a marca', () => {
   assert.equal(pinKey({ slot: 1, trigger_type: 'always', trigger_key: '' }), '1|always|');
   assert.equal(pinKey({ slot: 3, trigger_type: 'always' }), '3|always|');
 });
+
+// ---------------------------------------------------------------------------
+// Correções vindas do code review
+// ---------------------------------------------------------------------------
+
+test('escopo de superfície casa sem depender de caixa', () => {
+  // A regra é gravada normalizada; `surface` chega cru do request. Comparar sem
+  // normalizar faria a regra sumir sem nenhum sinal.
+  const base = { cartSkus: new Set(), cartProds: [], slots: 3, now: AGORA, goal: 'aov' };
+  const r = rule({ surface: 'pdp', offer_sku: 'P' });
+
+  assert.equal(resolvePins([r], { ...base, surface: 'PDP' }).bySlot.size, 1);
+  assert.equal(resolvePins([r], { ...base, surface: ' pdp ' }).bySlot.size, 1);
+  assert.equal(resolvePins([r], { ...base, surface: 'cart' }).bySlot.size, 0);
+});
+
+test('vaga fora do alcance é descartada COM o n no relatório', () => {
+  // O simulador roda com n=10 por padrão e a loja com n bem menor: uma regra na
+  // vaga 3 pode agir no simulador e nunca agir em produção. O descarte é o
+  // único lugar onde isso aparece.
+  const base = { cartSkus: new Set(), cartProds: [], slots: 1, now: AGORA };
+  const r = resolvePins([rule({ slot: 3, offer_sku: 'LONGE' })], base);
+  assert.equal(r.bySlot.size, 0);
+  const d = r.discarded.find((x) => x.why === 'slot_fora_do_alcance');
+  assert.ok(d);
+  assert.equal(d.detail, 'vaga 3 > n=1');
+  assert.equal(d.offer_sku, 'LONGE');
+});
+
+test('decide devolve o descarte, com o motivo de cada regra que não agiu', () => {
+  const c = ctx({
+    cartTotal: 200,
+    slots: 3,
+    pinRules: [
+      rule({ slot: 1, offer_sku: 'A', active: 0 }),
+      rule({ slot: 2, offer_sku: 'B', ends_at: '2020-01-01T00:00:00.000Z' }),
+      rule({ slot: 3, trigger_type: 'sku', trigger_key: 'NAO_ESTA', offer_sku: 'C' }),
+    ],
+  });
+  const { pins, pinsDiscarded } = decide([prod({ sku: 'Z', price: 60, cogs: 12 })], c);
+  assert.deepEqual(pins, []);
+  assert.deepEqual(
+    pinsDiscarded.map((d) => d.why).sort(),
+    ['expirada', 'gatilho_nao_casou', 'pausada'],
+  );
+});
+
+test('assembleSlots protege contra o mesmo produto em duas vagas', () => {
+  // resolvePins já desduplica, então isto guarda quem chama assembleSlots
+  // direto. Sem o teste, a guarda vira código morto sem ninguém notar.
+  const scored = [{ sku: 'A' }, { sku: 'B' }];
+  const bySlot = new Map([
+    [1, { slot: 1, trigger_type: 'always', trigger_key: '', offer_sku: 'A' }],
+    [2, { slot: 2, trigger_type: 'always', trigger_key: '', offer_sku: 'A' }],
+  ]);
+  const { offers, pins } = assembleSlots(scored, bySlot, new Map(), 3);
+  assert.equal(offers[0].sku, 'A');
+  assert.equal(offers[0].pinned, true);
+  const duplicada = pins.find((p) => p.slot_pedido === 2);
+  assert.equal(duplicada.applied, false);
+  assert.equal(duplicada.fallback_reason, 'produto_ja_fixado_em_outra_vaga');
+});

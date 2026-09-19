@@ -20,7 +20,7 @@ import { adaptDb, ensureSchema } from './db.js';
 import {
   decide, mergeConfig, functionalKey, round2, DEFAULT_CONFIG,
   parseCollectible, normTax, hashSeed, rngFrom, tsWindow,
-  PIN_SPECIFICITY, PIN_TRIGGER_FIELDS,
+  PIN_SPECIFICITY, PIN_TRIGGER_FIELDS, comparePins,
 } from './engine.js';
 
 const DEFAULT_ORIGINS = [
@@ -139,6 +139,9 @@ async function handleRecommend(request, db) {
     offers: n > 1 ? out.offers : undefined,
     context: out.context,
     pins: out.pins.length ? out.pins : undefined,
+    // O descarte só sai em debug: no carrinho ele seria uma lista por regra
+    // pausada ou fora de gatilho em TODA requisição, e o tema não usa.
+    pins_discarded: out.debug && out.pinsDiscarded.length ? out.pinsDiscarded : undefined,
     relaxed: out.relaxed.length ? out.relaxed : undefined,
     rejected: out.debug ? out.rejected : undefined,
     timings: out.debug ? out.timings : undefined,
@@ -376,7 +379,7 @@ async function runDecision(db, opts) {
   };
 
   const tDecide0 = Date.now();
-  const { offers, rejected, relaxed, pins } = decide(products, ctx);
+  const { offers, rejected, relaxed, pins, pinsDiscarded } = decide(products, ctx);
   const tDecide = Date.now() - tDecide0;
   const top = offers.slice(0, n).map((o) => (debug ? o : stripDebug(o)));
 
@@ -413,7 +416,8 @@ async function runDecision(db, opts) {
   const tLog = Date.now() - tLog0;
 
   return {
-    offer_id: offerId, offers: top, rejected, relaxed, pins, context, reason, debug,
+    offer_id: offerId, offers: top, rejected, relaxed, pins, pinsDiscarded, n,
+    context, reason, debug,
     timings: { query_ms: tQuery, decide_ms: tDecide, log_ms: tLog, rows: products.length },
   };
 }
@@ -423,7 +427,9 @@ function stripDebug(o) { const { _debug, ...rest } = o; return rest; }
 // Ordem dos campos no `wire` do group_concat. Uma constante só, ao lado da
 // query, porque isto é serialização — não decisão. `char(31)` (unit separator)
 // e `char(30)` (record separator) não aparecem em SKU nem em rótulo de
-// taxonomia, e `sqlLiteral` já recusa a família de bytes de controle na carga.
+// taxonomia, e `pinTuple` recusa na escrita qualquer valor que os contenha —
+// que é o único ponto onde dá para avisar alguém. (`sqlLiteral` NÃO cobre isso:
+// ele só recusa `\u0000`, e o caminho de /pins nem passa por ele.)
 const PIN_WIRE = ['slot', 'offer_sku', 'trigger_type', 'trigger_key', 'trigger_field',
   'trigger_value', 'surface', 'goal', 'active', 'starts_at', 'ends_at', 'priority',
   'updated_at'];
@@ -534,6 +540,12 @@ async function handleOffers(url, db) {
     context: out.context,
     relaxed: out.relaxed,
     pins: out.pins,
+    // No simulador o descarte sai sempre: é aqui que alguém vai perguntar
+    // "por que minha regra não apareceu?". `n` vem junto porque o padrão do
+    // /offers é 10 e o da loja é bem menor — uma regra na vaga 3 pode agir aqui
+    // e nunca agir lá, e `slot_fora_do_alcance` é o que denuncia isso.
+    n: out.n,
+    pins_discarded: out.pinsDiscarded,
     offers: out.offers,
     rejected_summary: rejectSummary(out.rejected),
     rejected: out.debug ? out.rejected : undefined,
@@ -792,6 +804,41 @@ function pinScope(v) {
   return s && s !== '*' ? s : '*';
 }
 
+const SIM = new Set(['1', 't', 'true', 'y', 'yes', 's', 'sim', 'v', 'verdadeiro', 'on']);
+const NAO = new Set(['0', 'f', 'false', 'n', 'no', 'nao', 'não', 'off']);
+
+/**
+ * `active` de uma regra: aceita o vocabulário que uma exportação de planilha
+ * realmente produz, e RECUSA o que não reconhece.
+ *
+ * O `truthy` genérico do arquivo trata tudo que não é `1|t|true` como falso —
+ * um lote com `active: "TRUE"` entraria com `applied: N`, `errors: []` e todas
+ * as regras pausadas em silêncio. Errar para o lado do erro visível é melhor:
+ * a linha ruim vira uma entrada em `errors[]` e alguém conserta.
+ */
+function pinActive(v) {
+  if (v === undefined || v === null || v === '') return 1;
+  if (v === true || v === 1) return 1;
+  if (v === false || v === 0) return 0;
+  const s = String(v).trim().toLowerCase();
+  if (SIM.has(s)) return 1;
+  if (NAO.has(s)) return 0;
+  throw new Error(`active não reconhecido: ${v}`);
+}
+
+// Os separadores do `wire` do group_concat. Um SKU ou rótulo que os contenha
+// produziria um registro com contagem de campos errada, e `parsePinRules` o
+// descartaria em silêncio — a regra sumiria de todo /recommend sem erro.
+// Recusar na escrita é o único ponto em que dá para avisar alguém.
+const SEPARADORES = /[\u001e\u001f]/;
+
+function semSeparador(v, campo) {
+  if (v != null && SEPARADORES.test(String(v))) {
+    throw new Error(`${campo} contém caractere de controle reservado`);
+  }
+  return v;
+}
+
 /**
  * Data → instante ISO em UTC, com o dia interpretado em BRT.
  *
@@ -831,14 +878,16 @@ function pinTuple(r, now) {
     throw new Error(`trigger_type inválido: ${r.trigger_type} (use ${Object.keys(PIN_SPECIFICITY).join(', ')})`);
   }
 
-  const offerSku = r.offer_sku != null ? String(r.offer_sku).trim() : '';
+  const offerSku = semSeparador(
+    r.offer_sku != null ? String(r.offer_sku).trim() : '', 'offer_sku',
+  );
   if (!offerSku) throw new Error('offer_sku obrigatório');
 
   let field = null;
   let value = null;
   let key = '';
   if (tipo === 'sku') {
-    key = String(r.trigger_sku ?? r.trigger_key ?? '').trim();
+    key = semSeparador(String(r.trigger_sku ?? r.trigger_key ?? '').trim(), 'trigger_sku');
     if (!key) throw new Error('trigger_sku obrigatório quando trigger_type=sku');
   } else if (tipo === 'taxonomy') {
     field = String(r.trigger_field ?? '').trim().toLowerCase();
@@ -848,15 +897,16 @@ function pinTuple(r, now) {
     // Gravado já normalizado: no seed medido, BODY SPLASH e Body Splash são a
     // mesma subcategoria. E "Não se aplica" é sentinela de ausência, não valor —
     // normTax devolve vazio e a regra é recusada aqui, não em produção.
-    value = normTax(r.trigger_value);
+    value = semSeparador(normTax(r.trigger_value), 'trigger_value');
     if (!value) throw new Error('trigger_value vazio ou sem significado taxonômico');
     key = `${field}=${value}`;
   }
 
   return [brand, slot, tipo, key, offerSku, field, value,
-    pinScope(r.surface), pinScope(r.goal),
+    semSeparador(pinScope(r.surface), 'surface'),
+    semSeparador(pinScope(r.goal), 'goal'),
     Math.round(Number(r.priority) || 0),
-    truthy(r.active ?? 1) ? 1 : 0,
+    pinActive(r.active),
     pinInstant(r.starts_at, 'inicio'),
     pinInstant(r.ends_at, 'fim'),
     r.note != null ? String(r.note) : null,
@@ -892,9 +942,20 @@ async function handleListPins(url, db) {
        FROM pin_rule r
        LEFT JOIN product p ON p.brand = r.brand AND p.sku = r.offer_sku
       ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
-      ORDER BY r.brand, r.slot, r.priority DESC, r.trigger_type DESC`,
+      ORDER BY r.brand, r.slot`,
     params,
   );
+
+  // A ordem dentro da vaga é a da DISPUTA, e vem do próprio comparador do
+  // engine — reescrevê-la em SQL criaria uma segunda versão da precedência que
+  // divergiria. Ordenar por `priority DESC` aqui, por exemplo, mostrava um
+  // `always` de prioridade 99 acima do `sku` que realmente vence, ensinando ao
+  // operador exatamente o modelo mental errado.
+  rows.sort((a, b) => (
+    String(a.brand).localeCompare(String(b.brand))
+    || a.slot - b.slot
+    || comparePins(a, b)
+  ));
 
   // O estado calculado vai junto: sem ele o painel teria que reimplementar a
   // regra de validade em JavaScript e as duas versões divergiriam.
@@ -916,11 +977,33 @@ async function handleListPins(url, db) {
   });
 }
 
+/** A linha existente que este corpo identifica, ou null. */
+async function pinAtual(db, body) {
+  const brand = normBrand(body.brand);
+  const slot = Number(body.slot);
+  const tipo = String(body.trigger_type ?? '').trim().toLowerCase();
+  if (!brand || !Number.isFinite(slot) || !tipo) return null;
+  return (await db.all(
+    'SELECT * FROM pin_rule WHERE brand=? AND slot=? AND trigger_type=? AND trigger_key=?',
+    [brand, Math.round(slot), tipo, pinNaturalKey(body)],
+  ))[0] || null;
+}
+
 async function handleSetPin(request, db) {
   const body = await readJson(request);
+
+  // Edição é PARCIAL. `INSERT OR REPLACE` reescreve a linha inteira, então sem
+  // mesclar com o que já está gravado um `{"active": 0}` — que a doc apresenta
+  // como a forma de pausar — apagaria vigência, escopo, prioridade e nota, e o
+  // "despausar" traria a regra de volta como `*`/`*` sem data de fim.
+  const atual = await pinAtual(db, body);
+  const entrada = atual
+    ? { ...atual, trigger_sku: atual.trigger_key, ...definidos(body) }
+    : body;
+
   let tuple;
   try {
-    tuple = pinTuple(body, new Date().toISOString());
+    tuple = pinTuple(entrada, new Date().toISOString());
   } catch (e) {
     return json({ error: 'invalid_rule', detail: String(e.message || e) }, 400);
   }
@@ -946,9 +1029,24 @@ async function handleSetPin(request, db) {
 
   return json({
     ok: true,
+    created: !atual,
     stored: row,
     warnings: conhecido ? [] : [`offer_sku ${offerSku} não está no catálogo de ${brand}`],
   });
+}
+
+/** Só as chaves realmente presentes no corpo — `undefined` não sobrescreve. */
+function definidos(obj) {
+  const out = {};
+  for (const [k, v] of Object.entries(obj || {})) if (v !== undefined) out[k] = v;
+  return out;
+}
+
+/** Linhas afetadas, nos dois drivers (node:sqlite `changes`, GoDeploy `rowsWritten`). */
+function linhasAfetadas(res) {
+  if (!res || typeof res !== 'object') return null;
+  const n = res.changes ?? res.rowsWritten ?? res.rows_written ?? null;
+  return n == null ? null : Number(n);
 }
 
 async function handleDeletePin(request, db) {
@@ -961,25 +1059,43 @@ async function handleDeletePin(request, db) {
     return json({ error: 'invalid_slot', slot: body.slot }, 400);
   }
 
-  let deleted;
-  if (body.trigger_type != null) {
+  // String vazia é ausência, não "tipo vazio". Um formulário que sempre envia o
+  // campo cairia no ramo de regra única e rodaria um DELETE que não casa com
+  // nada — devolvendo ok enquanto a regra segue no ar, fixando a vaga.
+  const tipo = body.trigger_type != null && String(body.trigger_type).trim() !== ''
+    ? String(body.trigger_type).trim().toLowerCase()
+    : null;
+
+  let escopo;
+  let res;
+  if (tipo) {
     if (slot == null) return json({ error: 'slot_required_with_trigger_type' }, 400);
-    deleted = { scope: 'regra' };
-    await db.run(
+    if (!Object.hasOwn(PIN_SPECIFICITY, tipo)) {
+      return json({ error: 'invalid_trigger_type', trigger_type: body.trigger_type }, 400);
+    }
+    escopo = 'regra';
+    res = await db.run(
       'DELETE FROM pin_rule WHERE brand=? AND slot=? AND trigger_type=? AND trigger_key=?',
-      [brand, slot, String(body.trigger_type).trim().toLowerCase(), pinNaturalKey(body)],
+      [brand, slot, tipo, pinNaturalKey(body)],
     );
   } else if (slot != null) {
-    deleted = { scope: 'vaga' };
-    await db.run('DELETE FROM pin_rule WHERE brand=? AND slot=?', [brand, slot]);
+    escopo = 'vaga';
+    res = await db.run('DELETE FROM pin_rule WHERE brand=? AND slot=?', [brand, slot]);
   } else {
     return json({ error: 'slot_or_trigger_type_required' }, 400);
+  }
+
+  // Apagar nada e responder ok é o pior desfecho: o operador acredita que
+  // removeu, e a regra continua decidindo o carrinho.
+  const apagadas = linhasAfetadas(res);
+  if (apagadas === 0) {
+    return json({ error: 'rule_not_found', brand, slot, scope: escopo }, 404);
   }
 
   const n = (await db.all(
     'SELECT COUNT(*) AS n FROM pin_rule WHERE brand = ?', [brand],
   ))[0].n;
-  return json({ ok: true, brand, ...deleted, remaining: n });
+  return json({ ok: true, brand, scope: escopo, deleted: apagadas, remaining: n });
 }
 
 async function handleCurate(table, request, db) {

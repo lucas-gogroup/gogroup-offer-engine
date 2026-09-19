@@ -1000,3 +1000,164 @@ test('banco que já existia sem pin_rule ganha a tabela sozinho', async () => {
   const health = await call(env, 'GET', '/health');
   assert.equal(health.body.counts.pin_rule, 1);
 });
+
+// ---------------------------------------------------------------------------
+// Correções vindas do code review
+// ---------------------------------------------------------------------------
+
+test('pausar uma regra não apaga vigência, escopo nem nota', async () => {
+  const env = newEnv();
+  await seed(env);
+
+  const criada = await call(env, 'POST', '/pins', {
+    brand: 'rituaria', slot: 2, trigger_type: 'sku', trigger_sku: 'RT01008',
+    offer_sku: 'RT02001', ends_at: '2026-12-31', starts_at: '2026-10-01',
+    surface: 'cart', goal: 'aov', priority: 7, note: 'campanha de fim de ano',
+  }, true);
+  assert.equal(criada.status, 200);
+  assert.equal(criada.body.created, true);
+
+  // A doc apresenta isto como a forma de pausar. Com INSERT OR REPLACE cru,
+  // apagaria vigência, escopo, prioridade e nota.
+  const pausada = await call(env, 'POST', '/pins', {
+    brand: 'rituaria', slot: 2, trigger_type: 'sku', trigger_sku: 'RT01008', active: 0,
+  }, true);
+  assert.equal(pausada.body.created, false, 'é edição, não criação');
+
+  const r = pausada.body.stored;
+  assert.equal(r.active, 0);
+  assert.equal(r.offer_sku, 'RT02001', 'o produto continua o mesmo');
+  assert.equal(r.ends_at, '2027-01-01T02:59:59.999Z', 'a vigência sobreviveu');
+  assert.equal(r.starts_at, '2026-10-01T03:00:00.000Z');
+  assert.equal(r.priority, 7);
+  assert.equal(r.note, 'campanha de fim de ano');
+  assert.equal(r.created_at, criada.body.stored.created_at, 'created_at não é reescrito');
+});
+
+test('delete que não casa com nada devolve 404, não ok', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [pinRow({ slot: 1, trigger_type: 'sku', trigger_sku: 'RT01008', offer_sku: 'RT02001' })],
+  }, true);
+
+  // trigger_type vazio é AUSÊNCIA, não "tipo vazio": um formulário que sempre
+  // manda o campo não pode cair no ramo de regra única e apagar nada em ok.
+  const vazio = await call(env, 'POST', '/pins/delete',
+    { brand: 'rituaria', slot: 1, trigger_type: '' }, true);
+  assert.equal(vazio.status, 200);
+  assert.equal(vazio.body.scope, 'vaga');
+  assert.equal(vazio.body.deleted, 1);
+
+  const denovo = await call(env, 'POST', '/pins/delete', { brand: 'rituaria', slot: 1 }, true);
+  assert.equal(denovo.status, 404, 'não apagou nada: tem que dizer');
+  assert.equal(denovo.body.error, 'rule_not_found');
+
+  const chaveErrada = await call(env, 'POST', '/pins/delete',
+    { brand: 'rituaria', slot: 1, trigger_type: 'sku', trigger_sku: 'INEXISTENTE' }, true);
+  assert.equal(chaveErrada.status, 404);
+});
+
+test('active aceita o vocabulário de planilha e recusa o que não entende', async () => {
+  const env = newEnv();
+  await seed(env);
+  const r = await call(env, 'POST', '/curate/pins', {
+    rows: [
+      pinRow({ slot: 1, active: 'TRUE' }),
+      pinRow({ slot: 2, active: 'Sim' }),
+      pinRow({ slot: 3, active: 'N' }),
+      pinRow({ slot: 4, active: 'talvez' }),
+    ],
+  }, true);
+
+  assert.equal(r.body.applied, 3);
+  assert.equal(r.body.errors.length, 1);
+  assert.match(r.body.errors[0].error, /active não reconhecido/);
+
+  const lista = await call(env, 'GET', '/pins?brand=rituaria');
+  const porSlot = Object.fromEntries(lista.body.rules.map((x) => [x.slot, x.active]));
+  assert.equal(porSlot[1], 1, '"TRUE" não pode virar regra pausada em silêncio');
+  assert.equal(porSlot[2], 1);
+  assert.equal(porSlot[3], 0);
+});
+
+test('valor com separador do wire é recusado na escrita', async () => {
+  const env = newEnv();
+  await seed(env);
+  const r = await call(env, 'POST', '/pins',
+    pinRow({ offer_sku: `RT0\u001f2001` }), true);
+  assert.equal(r.status, 400);
+  assert.match(r.body.detail, /caractere de controle reservado/);
+});
+
+test('/pins lista na ordem da disputa, não por prioridade crua', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [
+      // prioridade alta, mas gatilho fraco: NÃO pode aparecer em primeiro.
+      pinRow({ slot: 1, trigger_type: 'always', offer_sku: 'RT02001', priority: 99 }),
+      pinRow({ slot: 1, trigger_type: 'sku', trigger_sku: 'RT01008', offer_sku: 'RT01015', priority: 0 }),
+    ],
+  }, true);
+
+  const { body } = await call(env, 'GET', '/pins?brand=rituaria&slot=1');
+  assert.equal(body.rules[0].trigger_type, 'sku', 'quem vence a disputa vem primeiro');
+  assert.equal(body.rules[1].trigger_type, 'always');
+});
+
+test('o simulador explica a regra que não agiu', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [
+      pinRow({ slot: 1, offer_sku: 'RT02001', active: 0 }),
+      pinRow({ slot: 2, trigger_type: 'sku', trigger_sku: 'NAO_ESTA', offer_sku: 'RT01015' }),
+    ],
+  }, true);
+
+  const { body } = await call(env, 'GET', '/offers?brand=rituaria&anchor=RT01008&n=3');
+  assert.deepEqual(body.pins, []);
+  assert.equal(body.n, 3);
+  const motivos = body.pins_discarded.map((d) => d.why).sort();
+  assert.deepEqual(motivos, ['gatilho_nao_casou', 'pausada']);
+});
+
+test('regra numa vaga além do n da loja aparece como descartada', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [pinRow({ slot: 3, offer_sku: 'RT02001' })],
+  }, true);
+
+  // A loja pede n=1; o simulador, por padrão, pede 10. A regra da vaga 3 age
+  // num e não no outro — e é isso que o descarte denuncia.
+  const loja = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', n: 1, cart_total: 89.90, debug: true,
+    cart: [{ sku: 'RT01008', qty: 1, price: 89.90 }],
+  });
+  assert.equal(loja.body.pins, undefined);
+  const d = loja.body.pins_discarded.find((x) => x.why === 'slot_fora_do_alcance');
+  assert.equal(d.detail, 'vaga 3 > n=1');
+
+  const comTres = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', n: 3, cart_total: 89.90,
+    cart: [{ sku: 'RT01008', qty: 1, price: 89.90 }],
+  });
+  assert.equal(comTres.body.pins[0].applied, true, 'com n=3 a mesma regra age');
+});
+
+test('o carrinho não carrega a lista de descarte no caminho quente', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [pinRow({ slot: 1, offer_sku: 'RT02001', active: 0 })],
+  }, true);
+
+  const { body } = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', n: 3, cart_total: 89.90,
+    cart: [{ sku: 'RT01008', qty: 1, price: 89.90 }],
+  });
+  assert.equal(body.pins_discarded, undefined, 'só em debug');
+  assert.equal(body.pins, undefined);
+});

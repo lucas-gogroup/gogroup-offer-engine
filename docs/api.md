@@ -248,18 +248,46 @@ específica. O mesmo produto vencendo em duas vagas ocupa a **menor**.
 
 `GET /pins?brand=&slot=&active=` — aberto, como `/config` e `/log`. Devolve as
 regras mais o estado calculado: `expired`, `not_started`, `effective` e
-`offer_in_catalog` (avisa regra apontando para SKU que não existe).
+`offer_in_catalog` (avisa regra apontando para SKU que não existe). Dentro de
+cada vaga a lista vem **na ordem da disputa**, usando o mesmo comparador do
+motor — a primeira é a que venceria.
 
-`POST /pins` (bearer) — grava **uma** regra. Pausar é `{"active": 0}`, não
-precisa de rota própria. Recusa com `invalid_rule` e um `detail` legível.
+`POST /pins` (bearer) — grava **uma** regra, com **edição parcial**. A identidade
+é `brand` + `slot` + `trigger_type` + o gatilho (`trigger_sku`, ou
+`trigger_field` + `trigger_value`); os campos ausentes do corpo são preservados
+da linha existente. Por isso pausar é só `{"active": 0}` junto da identidade, sem
+perder vigência, escopo, prioridade nem nota. A resposta traz `created` dizendo
+se foi criação ou edição. Regra inválida volta `400 invalid_rule` com um
+`detail` legível.
 
 `POST /pins/delete` (bearer) — `{brand, slot, trigger_type, trigger_sku}` remove
-uma regra; `{brand, slot}` limpa a vaga inteira. É POST porque o CORS do app só
-libera `GET, POST, OPTIONS`.
+uma regra; `{brand, slot}` limpa a vaga inteira. **Devolve `404 rule_not_found`
+quando nada casou** — apagar nada e responder ok faria o operador acreditar que
+removeu enquanto a regra segue decidindo o carrinho. É POST porque o CORS do app
+só libera `GET, POST, OPTIONS`.
 
-`POST /curate/pins` (bearer) — carga em lote, no formato dos outros `/curate`:
-`INSERT OR REPLACE` sobre a chave natural, com `errors[]` por linha. E
+`POST /curate/pins` (bearer) — carga em lote, no formato dos outros `/curate`.
+Diferente do `POST /pins`, aqui é **substituição total** da linha, como nas
+outras tabelas de carga: campo que não vier volta ao default. Erros saem por
+linha em `errors[]` sem derrubar o lote. E
 `POST /curate/reset?table=pins&brand=` zera antes de recarregar.
+
+`active` aceita o que uma exportação de planilha produz — `1/0`, `true/false`,
+`sim/não`, `yes/no`, `y/n`, `t/f`, `on/off`, em qualquer caixa — e **recusa** o
+que não reconhece, em vez de assumir "pausada" em silêncio.
+
+### Por que uma regra não apareceu
+
+`GET /offers` devolve sempre `pins_discarded`, com o motivo de cada regra que
+existe e não agiu: `pausada`, `expirada`, `ainda_nao_comecou`, `gatilho_nao_casou`,
+`outra_superficie`, `outro_goal`, `slot_fora_do_alcance`,
+`produto_ja_fixado_em_vaga_menor`. No `/recommend` isso só sai com `debug: true` —
+no carrinho seria uma lista por regra pausada em toda requisição.
+
+> **Simule com o mesmo `n` da loja.** O `/offers` usa `n=10` por padrão e o tema
+> pede bem menos. Uma regra na vaga 3 age no simulador e **não** age num
+> `/recommend` com `n: 1` — o descarte `slot_fora_do_alcance` traz o `n` no
+> `detail` justamente para isso não passar batido.
 
 ---
 
