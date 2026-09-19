@@ -564,3 +564,26 @@ test('assembleSlots protege contra o mesmo produto em duas vagas', () => {
   assert.equal(duplicada.applied, false);
   assert.equal(duplicada.fallback_reason, 'produto_ja_fixado_em_outra_vaga');
 });
+
+test('o motivo mais acionável vence no descarte', () => {
+  // Pausada E na vaga 5 com n=3: relatar "fora do alcance" faria o operador
+  // aumentar o n do tema e nada acontecer — ela estava pausada o tempo todo.
+  const base = { cartSkus: new Set(), cartProds: [], slots: 3, now: AGORA };
+  const r = resolvePins([rule({ slot: 5, active: 0, offer_sku: 'X' })], base);
+  assert.equal(r.discarded[0].why, 'pausada');
+
+  const expirada = resolvePins(
+    [rule({ slot: 5, ends_at: '2020-01-01T00:00:00.000Z', offer_sku: 'X' })], base,
+  );
+  assert.equal(expirada.discarded[0].why, 'expirada');
+
+  const semGatilho = resolvePins(
+    [rule({ slot: 5, trigger_type: 'sku', trigger_key: 'AUSENTE', offer_sku: 'X' })], base,
+  );
+  assert.equal(semGatilho.discarded[0].why, 'gatilho_nao_casou');
+
+  // Só quando nada mais impede é que a vaga é o motivo de fato.
+  const sobra = resolvePins([rule({ slot: 5, offer_sku: 'X' })], base);
+  assert.equal(sobra.discarded[0].why, 'slot_fora_do_alcance');
+  assert.equal(sobra.discarded[0].detail, 'vaga 5 > n=3');
+});

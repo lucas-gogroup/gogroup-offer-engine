@@ -129,7 +129,22 @@ async function handleRecommend(request, db) {
 
   out.latency_ms = Date.now() - t0;
   if (!out.offers.length) {
-    return json({ ...out, offer_id: out.offer_id, offers: [], reason: out.reason }, 200);
+    // Forma explícita, não `...out`: o espalhamento publicava o objeto interno
+    // inteiro — a lista de rejeitados, os tempos e, depois desta feature, o
+    // relatório de curadoria com cada regra, seu produto e o motivo de não ter
+    // agido — numa rota pública e sem debug.
+    return json({
+      offer_id: out.offer_id,
+      offers: [],
+      reason: out.reason,
+      context: out.context,
+      relaxed: out.relaxed.length ? out.relaxed : undefined,
+      rejected: out.debug ? out.rejected : undefined,
+      pins: out.pins.length ? out.pins : undefined,
+      pins_discarded: out.debug && out.pinsDiscarded.length ? out.pinsDiscarded : undefined,
+      timings: out.debug ? out.timings : undefined,
+      latency_ms: out.latency_ms,
+    }, 200);
   }
   const top = out.offers[0];
   return json({
@@ -494,9 +509,12 @@ async function handleOffers(url, db) {
   // `cart=` monta um carrinho de teste com vários itens. Sem isso não dá para
   // simular gatilho taxonômico — que casa contra o carrinho inteiro, não só a
   // âncora — e é justamente o caso mais difícil de acertar de cabeça.
+  // Limitado como todo o resto do arquivo (`n` em 50, `limit` em 500): sem teto,
+  // uma lista de mil SKUs vira um `IN (?, ?, …)` acima do máximo de variáveis do
+  // SQLite, o erro sobe para o catch do topo e o 500 devolve o stack.
   const extras = (q.get('cart') || '').split(',')
     .map((s) => s.trim()).filter(Boolean).filter((s) => s !== anchor);
-  const querSkus = [anchor, ...new Set(extras)];
+  const querSkus = [anchor, ...new Set(extras)].slice(0, MAX_CART_SIM);
   const rows = await db.all(
     `SELECT * FROM product WHERE brand = ? AND sku IN (${querSkus.map(() => '?').join(',')})`,
     [brand, ...querSkus],
@@ -697,6 +715,7 @@ const PIN_COLS = ['brand', 'slot', 'trigger_type', 'trigger_key', 'offer_sku',
   'starts_at', 'ends_at', 'note', 'created_at', 'updated_at'];
 
 const MAX_SLOT = 10; // o teto de `n` em /recommend
+const MAX_CART_SIM = 30; // itens do carrinho de teste em /offers?cart=
 
 const SPECS = {
   product: {
@@ -932,12 +951,19 @@ async function handleListPins(url, db) {
   if (q.get('slot')) { where.push('r.slot = ?'); params.push(Math.round(Number(q.get('slot')))); }
   const activeQ = q.get('active');
   if (activeQ != null && activeQ !== '') {
+    // O mesmo vocabulário da escrita. Com o `truthy` genérico, `?active=sim`
+    // virava `active = 0` e o painel pedia as regras no ar e recebia as
+    // pausadas — a resposta mais enganosa possível para quem opera.
+    let v;
+    try { v = pinActive(activeQ); } catch {
+      return json({ error: 'invalid_active', active: activeQ }, 400);
+    }
     where.push('r.active = ?');
-    params.push(truthy(activeQ) ? 1 : 0);
+    params.push(v);
   }
 
   const rows = await db.all(
-    `SELECT r.*, p.title AS offer_title, p.price AS offer_price,
+    `SELECT r.*, p.sku AS catalogo_sku, p.title AS offer_title, p.price AS offer_price,
             p.available AS offer_available
        FROM pin_rule r
        LEFT JOIN product p ON p.brand = r.brand AND p.sku = r.offer_sku
@@ -966,12 +992,16 @@ async function handleListPins(url, db) {
     rules: rows.map((r) => {
       const expirada = !!(r.ends_at && String(r.ends_at) < now);
       const naoComecou = !!(r.starts_at && String(r.starts_at) > now);
+      const { catalogo_sku: catalogo, ...regra } = r;
       return {
-        ...r,
+        ...regra,
         expired: expirada,
         not_started: naoComecou,
         effective: Number(r.active) === 1 && !expirada && !naoComecou,
-        offer_in_catalog: r.offer_title != null,
+        // Pela CHAVE do join, nunca por `title`: a coluna é anulável e vem de
+        // carga de planilha, então um produto sem título viraria "regra
+        // apontando para SKU que não existe" na cara do operador.
+        offer_in_catalog: catalogo != null,
       };
     }),
   });
@@ -989,64 +1019,96 @@ async function pinAtual(db, body) {
   ))[0] || null;
 }
 
+/**
+ * Colunas editáveis numa atualização parcial, cada uma com sua normalização.
+ * O gatilho e a vaga ficam de fora de propósito: mudá-los muda a identidade da
+ * regra, e isso é criar outra — não editar esta.
+ */
+const PIN_EDITAVEL = {
+  offer_sku: (v) => {
+    const s = semSeparador(v != null ? String(v).trim() : '', 'offer_sku');
+    if (!s) throw new Error('offer_sku não pode ficar vazio');
+    return s;
+  },
+  surface: (v) => semSeparador(pinScope(v), 'surface'),
+  goal: (v) => semSeparador(pinScope(v), 'goal'),
+  priority: (v) => Math.round(Number(v) || 0),
+  active: pinActive,
+  starts_at: (v) => pinInstant(v, 'inicio'),
+  ends_at: (v) => pinInstant(v, 'fim'),
+  note: (v) => (v != null ? String(v) : null),
+};
+
 async function handleSetPin(request, db) {
   const body = await readJson(request);
-
-  // Edição é PARCIAL. `INSERT OR REPLACE` reescreve a linha inteira, então sem
-  // mesclar com o que já está gravado um `{"active": 0}` — que a doc apresenta
-  // como a forma de pausar — apagaria vigência, escopo, prioridade e nota, e o
-  // "despausar" traria a regra de volta como `*`/`*` sem data de fim.
+  const agora = new Date().toISOString();
   const atual = await pinAtual(db, body);
-  const entrada = atual
-    ? { ...atual, trigger_sku: atual.trigger_key, ...definidos(body) }
-    : body;
 
-  let tuple;
-  try {
-    tuple = pinTuple(entrada, new Date().toISOString());
-  } catch (e) {
-    return json({ error: 'invalid_rule', detail: String(e.message || e) }, 400);
+  let row;
+  if (atual) {
+    // Edição PARCIAL e atômica. Um `INSERT OR REPLACE` da linha mesclada em
+    // memória perderia a escrita concorrente de outra aba — e como é a mescla
+    // que torna `{"active": 0}` seguro, a escrita perdida seria uma pausa
+    // silenciosamente revertida, não um campo velho.
+    const cols = [];
+    const vals = [];
+    try {
+      for (const [k, norm] of Object.entries(PIN_EDITAVEL)) {
+        if (body[k] === undefined) continue;
+        cols.push(k);
+        vals.push(norm(body[k]));
+      }
+    } catch (e) {
+      return json({ error: 'invalid_rule', detail: String(e.message || e) }, 400);
+    }
+    if (!cols.length) return json({ error: 'nothing_to_update' }, 400);
+
+    cols.push('updated_at');
+    vals.push(agora);
+    await db.run(
+      `UPDATE pin_rule SET ${cols.map((c) => `${c} = ?`).join(', ')}
+        WHERE brand=? AND slot=? AND trigger_type=? AND trigger_key=?`,
+      [...vals, atual.brand, atual.slot, atual.trigger_type, atual.trigger_key],
+    );
+    row = (await db.all(
+      'SELECT * FROM pin_rule WHERE brand=? AND slot=? AND trigger_type=? AND trigger_key=?',
+      [atual.brand, atual.slot, atual.trigger_type, atual.trigger_key],
+    ))[0];
+  } else {
+    let tuple;
+    try {
+      tuple = pinTuple(body, agora);
+    } catch (e) {
+      return json({ error: 'invalid_rule', detail: String(e.message || e) }, 400);
+    }
+    await db.run(
+      `INSERT OR REPLACE INTO pin_rule (${PIN_COLS.join(', ')})
+       VALUES (${PIN_COLS.map(() => '?').join(', ')})`,
+      tuple,
+    );
+    row = (await db.all(
+      'SELECT * FROM pin_rule WHERE brand=? AND slot=? AND trigger_type=? AND trigger_key=?',
+      [tuple[0], tuple[1], tuple[2], tuple[3]],
+    ))[0];
   }
 
-  await db.run(
-    `INSERT OR REPLACE INTO pin_rule (${PIN_COLS.join(', ')})
-     VALUES (${PIN_COLS.map(() => '?').join(', ')})`,
-    tuple,
-  );
-
-  const [brand, slot, tipo, key, offerSku] = tuple;
-  const row = (await db.all(
-    'SELECT * FROM pin_rule WHERE brand=? AND slot=? AND trigger_type=? AND trigger_key=?',
-    [brand, slot, tipo, key],
-  ))[0];
-
   // Não recusar SKU fora do catálogo: a ordem de carga não é garantida e a
-  // regra pode chegar antes do produto. Mas avisar, porque regra apontando
-  // para SKU fantasma é regra que nunca vai aparecer.
-  const conhecido = (await db.all(
-    'SELECT 1 AS ok FROM product WHERE brand=? AND sku=?', [brand, offerSku],
+  // regra pode chegar antes do produto. Mas avisar, porque regra apontando para
+  // SKU fantasma é regra que nunca vai aparecer. Vale para o gatilho também: o
+  // casamento por SKU é exato, então um código com a caixa errada nunca dispara
+  // e sai como `gatilho_nao_casou`, indistinguível de carrinho que não bate.
+  const warnings = [];
+  const noCatalogo = async (sku) => (await db.all(
+    'SELECT 1 AS ok FROM product WHERE brand=? AND sku=?', [row.brand, sku],
   ))[0];
+  if (!await noCatalogo(row.offer_sku)) {
+    warnings.push(`offer_sku ${row.offer_sku} não está no catálogo de ${row.brand}`);
+  }
+  if (row.trigger_type === 'sku' && !await noCatalogo(row.trigger_key)) {
+    warnings.push(`trigger_sku ${row.trigger_key} não está no catálogo de ${row.brand} — o casamento é exato, confira a grafia`);
+  }
 
-  return json({
-    ok: true,
-    created: !atual,
-    stored: row,
-    warnings: conhecido ? [] : [`offer_sku ${offerSku} não está no catálogo de ${brand}`],
-  });
-}
-
-/** Só as chaves realmente presentes no corpo — `undefined` não sobrescreve. */
-function definidos(obj) {
-  const out = {};
-  for (const [k, v] of Object.entries(obj || {})) if (v !== undefined) out[k] = v;
-  return out;
-}
-
-/** Linhas afetadas, nos dois drivers (node:sqlite `changes`, GoDeploy `rowsWritten`). */
-function linhasAfetadas(res) {
-  if (!res || typeof res !== 'object') return null;
-  const n = res.changes ?? res.rowsWritten ?? res.rows_written ?? null;
-  return n == null ? null : Number(n);
+  return json({ ok: true, created: !atual, stored: row, warnings });
 }
 
 async function handleDeletePin(request, db) {
@@ -1067,35 +1129,38 @@ async function handleDeletePin(request, db) {
     : null;
 
   let escopo;
-  let res;
+  let onde;
+  let params;
   if (tipo) {
     if (slot == null) return json({ error: 'slot_required_with_trigger_type' }, 400);
     if (!Object.hasOwn(PIN_SPECIFICITY, tipo)) {
       return json({ error: 'invalid_trigger_type', trigger_type: body.trigger_type }, 400);
     }
     escopo = 'regra';
-    res = await db.run(
-      'DELETE FROM pin_rule WHERE brand=? AND slot=? AND trigger_type=? AND trigger_key=?',
-      [brand, slot, tipo, pinNaturalKey(body)],
-    );
+    onde = 'brand=? AND slot=? AND trigger_type=? AND trigger_key=?';
+    params = [brand, slot, tipo, pinNaturalKey(body)];
   } else if (slot != null) {
     escopo = 'vaga';
-    res = await db.run('DELETE FROM pin_rule WHERE brand=? AND slot=?', [brand, slot]);
+    onde = 'brand=? AND slot=?';
+    params = [brand, slot];
   } else {
     return json({ error: 'slot_or_trigger_type_required' }, 400);
   }
 
-  // Apagar nada e responder ok é o pior desfecho: o operador acredita que
+  // Conta ANTES de apagar, em vez de confiar no contador do driver. Nem todo
+  // driver devolve linhas afetadas, e um `null` tratado como sucesso recria
+  // exatamente o desfecho que o 404 existe para evitar: o operador acredita que
   // removeu, e a regra continua decidindo o carrinho.
-  const apagadas = linhasAfetadas(res);
-  if (apagadas === 0) {
+  const alvo = (await db.all(`SELECT COUNT(*) AS n FROM pin_rule WHERE ${onde}`, params))[0].n;
+  if (!alvo) {
     return json({ error: 'rule_not_found', brand, slot, scope: escopo }, 404);
   }
+  await db.run(`DELETE FROM pin_rule WHERE ${onde}`, params);
 
   const n = (await db.all(
     'SELECT COUNT(*) AS n FROM pin_rule WHERE brand = ?', [brand],
   ))[0].n;
-  return json({ ok: true, brand, scope: escopo, deleted: apagadas, remaining: n });
+  return json({ ok: true, brand, scope: escopo, deleted: Number(alvo), remaining: n });
 }
 
 async function handleCurate(table, request, db) {

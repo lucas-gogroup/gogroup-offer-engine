@@ -254,11 +254,21 @@ motor — a primeira é a que venceria.
 
 `POST /pins` (bearer) — grava **uma** regra, com **edição parcial**. A identidade
 é `brand` + `slot` + `trigger_type` + o gatilho (`trigger_sku`, ou
-`trigger_field` + `trigger_value`); os campos ausentes do corpo são preservados
-da linha existente. Por isso pausar é só `{"active": 0}` junto da identidade, sem
-perder vigência, escopo, prioridade nem nota. A resposta traz `created` dizendo
-se foi criação ou edição. Regra inválida volta `400 invalid_rule` com um
-`detail` legível.
+`trigger_field` + `trigger_value`). Se a regra já existe, só os campos enviados
+mudam, num `UPDATE` das colunas informadas — então duas edições simultâneas de
+campos diferentes não se atropelam. Por isso pausar é só `{"active": 0}` junto da
+identidade, sem perder vigência, escopo, prioridade nem nota.
+
+Editáveis desta forma: `offer_sku`, `surface`, `goal`, `priority`, `active`,
+`starts_at`, `ends_at`, `note`. **Vaga e gatilho não**, porque mudá-los muda a
+identidade — isso é criar outra regra e apagar a antiga.
+
+A resposta traz `created` dizendo se foi criação ou edição, e `warnings` quando
+`offer_sku` ou `trigger_sku` não estão no catálogo da marca. O casamento por SKU
+é **exato**: um código com a grafia errada nunca dispara e aparece só como
+`gatilho_nao_casou`, indistinguível de um carrinho que legitimamente não bate —
+por isso o aviso na escrita. Regra inválida volta `400 invalid_rule` com um
+`detail` legível; um corpo só com a identidade volta `400 nothing_to_update`.
 
 `POST /pins/delete` (bearer) — `{brand, slot, trigger_type, trigger_sku}` remove
 uma regra; `{brand, slot}` limpa a vaga inteira. **Devolve `404 rule_not_found`

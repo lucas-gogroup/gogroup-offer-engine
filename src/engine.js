@@ -680,17 +680,6 @@ export function resolvePins(rules, ctx) {
   for (const r of rules) {
     const slot = Number(r.slot);
     if (!Number.isFinite(slot) || slot < 1) { fora(r, 'slot_invalido'); continue; }
-    // Vaga além do que o carrinho renderiza não é erro: é regra guardada para
-    // quando o tema mostrar mais ofertas. Mas o descarte vai para o relatório
-    // com o `n` do request — é a diferença entre o simulador (n=10 por padrão)
-    // e a loja, e sem isso a regra "some" sem explicação.
-    if (slots > 0 && slot > slots) {
-      discarded.push({
-        rule: pinKey(r), why: 'slot_fora_do_alcance', offer_sku: r.offer_sku ?? null,
-        detail: `vaga ${slot} > n=${slots}`,
-      });
-      continue;
-    }
     if (Number(r.active) !== 1) { fora(r, 'pausada'); continue; }
     if (r.starts_at && String(r.starts_at) > now) { fora(r, 'ainda_nao_comecou'); continue; }
     if (r.ends_at && String(r.ends_at) < now) { fora(r, 'expirada'); continue; }
@@ -700,6 +689,21 @@ export function resolvePins(rules, ctx) {
     if (escopoGoal && escopoGoal !== '*' && escopoGoal !== goal) { fora(r, 'outro_goal'); continue; }
     if (!r.offer_sku) { fora(r, 'sem_offer_sku'); continue; }
     if (!pinTriggerMatches(r, ctx)) { fora(r, 'gatilho_nao_casou'); continue; }
+
+    // A faixa de vaga é a ÚLTIMA checagem, de propósito. Vaga além do que o
+    // carrinho renderiza não é erro de regra: é regra guardada para quando o
+    // tema mostrar mais ofertas. Checada antes, uma regra pausada na vaga 5
+    // seria relatada como "fora do alcance", o operador aumentaria o `n` do
+    // tema e nada aconteceria — ela estava pausada o tempo todo. Depois de
+    // tudo, só sobra este motivo quando ele é de fato o que impede, e aí o
+    // `n` no detalhe é a diferença entre o simulador e a loja.
+    if (slots > 0 && slot > slots) {
+      discarded.push({
+        rule: pinKey(r), why: 'slot_fora_do_alcance', offer_sku: r.offer_sku ?? null,
+        detail: `vaga ${slot} > n=${slots}`,
+      });
+      continue;
+    }
     elegiveis.push(slot === r.slot ? r : { ...r, slot });
   }
 

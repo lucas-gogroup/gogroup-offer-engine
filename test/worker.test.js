@@ -1161,3 +1161,117 @@ test('o carrinho não carrega a lista de descarte no caminho quente', async () =
   assert.equal(body.pins_discarded, undefined, 'só em debug');
   assert.equal(body.pins, undefined);
 });
+
+test('carrinho sem oferta não publica o relatório de curadoria', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [pinRow({ slot: 1, offer_sku: 'RT02001', active: 0 })],
+  }, true);
+
+  // Carrinho com tudo dentro: o único candidato restante é o kit, que a
+  // integridade barra. Resultado: nenhuma oferta.
+  const { body } = await call(env, 'POST', '/recommend', {
+    brand: 'rituaria', n: 3, cart_total: 214.80,
+    cart: [
+      { sku: 'RT01008', qty: 1, price: 89.90 },
+      { sku: 'RT01015', qty: 1, price: 79.90 },
+      { sku: 'RT02001', qty: 1, price: 45.00 },
+    ],
+  });
+  assert.deepEqual(body.offers, []);
+  assert.equal(body.pins_discarded, undefined, 'sem debug não vaza o descarte');
+  assert.equal(body.pinsDiscarded, undefined, 'nem sob o nome interno');
+  assert.equal(body.rejected, undefined, 'nem a lista de rejeitados');
+  assert.equal(body.timings, undefined);
+  assert.ok(body.reason, 'mas o motivo continua lá');
+});
+
+test('/pins?active= entende o mesmo vocabulário da escrita', async () => {
+  const env = newEnv();
+  await seed(env);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [
+      pinRow({ slot: 1, offer_sku: 'RT02001', active: 1 }),
+      pinRow({ slot: 2, offer_sku: 'RT01008', active: 0 }),
+    ],
+  }, true);
+
+  // Com o truthy genérico isto devolvia exatamente as pausadas.
+  const sim = await call(env, 'GET', '/pins?brand=rituaria&active=sim');
+  assert.equal(sim.body.count, 1);
+  assert.equal(sim.body.rules[0].slot, 1);
+
+  const nao = await call(env, 'GET', '/pins?brand=rituaria&active=nao');
+  assert.equal(nao.body.rules[0].slot, 2);
+
+  const ruim = await call(env, 'GET', '/pins?brand=rituaria&active=talvez');
+  assert.equal(ruim.status, 400);
+});
+
+test('produto sem título não vira regra fantasma na listagem', async () => {
+  const env = newEnv();
+  await call(env, 'POST', '/curate/product', {
+    rows: [{ brand: 'rituaria', sku: 'SEM-TITULO', variant_id: '1', price: 50, cogs: 12, available: 10 }],
+  }, true);
+  await call(env, 'POST', '/curate/pins', {
+    rows: [pinRow({ slot: 1, offer_sku: 'SEM-TITULO' })],
+  }, true);
+
+  const { body } = await call(env, 'GET', '/pins?brand=rituaria');
+  assert.equal(body.rules[0].offer_title, null);
+  assert.equal(body.rules[0].offer_in_catalog, true, 'existe no catálogo, só não tem título');
+});
+
+test('edição parcial não perde escrita concorrente', async () => {
+  const env = newEnv();
+  await seed(env);
+  const id = { brand: 'rituaria', slot: 1, trigger_type: 'sku', trigger_sku: 'RT01008' };
+  await call(env, 'POST', '/pins', { ...id, offer_sku: 'RT02001', note: 'original', priority: 1 }, true);
+
+  // Duas abas leem o mesmo estado e escrevem campos diferentes. Com mescla em
+  // memória + INSERT OR REPLACE, a segunda apagaria a pausa da primeira.
+  await Promise.all([
+    call(env, 'POST', '/pins', { ...id, active: 0 }, true),
+    call(env, 'POST', '/pins', { ...id, note: 'editado pela outra aba' }, true),
+  ]);
+
+  const { body } = await call(env, 'GET', '/pins?brand=rituaria');
+  const r = body.rules[0];
+  assert.equal(r.active, 0, 'a pausa sobreviveu');
+  assert.equal(r.note, 'editado pela outra aba', 'e a nota também');
+  assert.equal(r.priority, 1, 'o campo não tocado ficou intacto');
+});
+
+test('edição parcial sem nada para mudar é recusada', async () => {
+  const env = newEnv();
+  await seed(env);
+  const id = { brand: 'rituaria', slot: 1, trigger_type: 'sku', trigger_sku: 'RT01008' };
+  await call(env, 'POST', '/pins', { ...id, offer_sku: 'RT02001' }, true);
+  const r = await call(env, 'POST', '/pins', id, true);
+  assert.equal(r.status, 400);
+  assert.equal(r.body.error, 'nothing_to_update');
+});
+
+test('gatilho por SKU fora do catálogo é avisado na escrita', async () => {
+  const env = newEnv();
+  await seed(env);
+  // O casamento por SKU é exato: a grafia errada nunca dispara e sai como
+  // "gatilho não casou", indistinguível de carrinho que não bate.
+  const r = await call(env, 'POST', '/pins', {
+    brand: 'rituaria', slot: 1, trigger_type: 'sku', trigger_sku: 'rt01008',
+    offer_sku: 'RT02001',
+  }, true);
+  assert.equal(r.body.warnings.length, 1);
+  assert.match(r.body.warnings[0], /trigger_sku rt01008/);
+  assert.match(r.body.warnings[0], /casamento é exato/);
+});
+
+test('/offers?cart= tem teto, como todo o resto do arquivo', async () => {
+  const env = newEnv();
+  await seed(env);
+  const muitos = Array.from({ length: 400 }, (_, i) => `X${i}`).join(',');
+  const { status, body } = await call(env, 'GET', `/offers?brand=rituaria&anchor=RT01008&cart=${muitos}`);
+  assert.equal(status, 200, 'não pode virar 500 com stack');
+  assert.ok(body.cart_skus.length <= 31);
+});
