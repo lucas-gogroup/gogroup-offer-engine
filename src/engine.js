@@ -68,11 +68,18 @@ export function mergeConfig(row) {
  * @param {object} cand        linha de `product`
  * @param {object} ctx         { cartSkus:Set, giftSkus:Set, giftKeys:Set, cartTotal,
  *                               kitComponentsOf:Map<kit,Set<comp>>,
- *                               cartKitComponents:Set, gap, goal, priceTarget, cfg }
+ *                               cartKitComponents:Set, gap, goal, priceTarget, cfg,
+ *                               pinnedSkus?:Set }
  * @returns {null|{code:string, detail?:string}} null = passou
  */
 export function hardFilterReject(cand, ctx) {
   const cfg = ctx.cfg;
+
+  // Curadoria dispensa APENAS as travas econômicas — teto de preço e preço
+  // mínimo, marcados abaixo. As de integridade continuam soberanas: um kit que
+  // entrega metade do que o cliente já comprou não vira oferta porque alguém
+  // marcou num painel. É literalmente a falha fotografada no carrinho real.
+  const pinned = !!(ctx.pinnedSkus && ctx.pinnedSkus.has(cand.sku));
 
   // R1a — o próprio SKU já está no carrinho
   if (ctx.cartSkus.has(cand.sku)) return { code: 'sku_in_cart' };
@@ -117,7 +124,7 @@ export function hardFilterReject(cand, ctx) {
   if (!cand.variant_id) return { code: 'no_variant_id' };
 
   // §3.1 — piso absoluto. Ofertar R$ 14,90 num carrinho de R$ 719 não é upsell.
-  if (cand.price < cfg.min_price) return { code: 'below_min_price' };
+  if (!pinned && cand.price < cfg.min_price) return { code: 'below_min_price' };
 
   // R4 — teto de preço, com duas saídas.
   //
@@ -128,7 +135,9 @@ export function hardFilterReject(cand, ctx) {
   // Saída 1: piso absoluto, que devolve o carrinho de entrada ao jogo.
   // Saída 2: quem FECHA o benefício passa por cima do teto. Não é exceção
   //          arbitrária — é o objetivo declarado do próprio cliente.
-  if (ctx.cartTotal > 0 && cand.price > priceCap(ctx, cfg)
+  // Saída 3: curadoria. Quem foi fixado à mão passa do teto por decisão de
+  // negócio — e é só o teto: o piso de margem continua cobrado no score.
+  if (!pinned && ctx.cartTotal > 0 && cand.price > priceCap(ctx, cfg)
       && !capExemptByBenefit(cand.price, ctx.gap, cfg)) {
     return { code: 'over_price_cap', detail: `${cand.price}>${round2(priceCap(ctx, cfg))}` };
   }
@@ -454,7 +463,7 @@ export function incentiveLadder(cand, ctx) {
 // Copy determinístico por regra (AI Proxy é roadmap; não bloqueia)
 // ---------------------------------------------------------------------------
 
-export function buildCopy(cand, { anchorProd, gap, incentive, urgency, cfg, lineLabels }) {
+export function buildCopy(cand, { anchorProd, gap, incentive, urgency, cfg, lineLabels, pinned }) {
   const title = cand.title || cand.sku;
   if (incentive.type === 'threshold') {
     const label = incentive.label || 'frete grátis';
@@ -481,6 +490,11 @@ export function buildCopy(cand, { anchorProd, gap, incentive, urgency, cfg, line
   if (urgency >= 1.5 && cand.available != null && cand.available < teto) {
     return `Últimas unidades: ${title}`;
   }
+  // "Quem levou esse também levou" é afirmação sobre outros compradores, e a
+  // curadoria justamente coloca na vitrine produto que ninguém comprou junto
+  // ainda — um lançamento fixado à mão sairia prometendo uma co-compra que não
+  // existe. Quem escolheu foi uma pessoa da marca, não o histórico.
+  if (pinned) return `Leve também ${title}`;
   return `Quem levou esse também levou ${title}`;
 }
 
@@ -560,6 +574,311 @@ function gaussian(rnd) {
 }
 
 // ---------------------------------------------------------------------------
+// Curadoria manual — pin por vaga
+//
+// Precedência de regra É decisão de oferta, então mora aqui: funções puras,
+// testáveis sem banco e sem relógio de sistema, como o resto do arquivo.
+// ---------------------------------------------------------------------------
+
+/** Quanto mais específico o "se", mais forte a regra. É a única frase que o
+ *  operador precisa guardar — e é por isso que `priority` NÃO vem antes. */
+export const PIN_SPECIFICITY = { sku: 3, taxonomy: 2, always: 1 };
+export const PIN_FIELD_SPECIFICITY = { subcategory: 3, line: 2, category: 1 };
+export const PIN_TRIGGER_FIELDS = ['category', 'subcategory', 'line'];
+
+const lowerField = (v) => String(v ?? '').trim().toLowerCase();
+
+/** Escopo ausente vale para todos. Nunca vazio, para a chave não ter buraco. */
+const escopo = (v) => lowerField(v) || '*';
+
+/**
+ * Chave natural da regra sem a marca — identifica a regra no log e na saída.
+ *
+ * O escopo entra, porque entra na PK: sem ele duas regras diferentes da mesma
+ * vaga (uma do carrinho, outra da PDP) apareceriam com a MESMA chave no
+ * `pins[]`, no `pinsDiscarded[]` e no decision_log, e não haveria como saber
+ * qual delas agiu. Só aparece quando não é o curinga, para o caso comum
+ * continuar legível: `1|always|` em vez de `1|always||*|*`.
+ */
+export function pinKey(r) {
+  const base = `${r.slot}|${r.trigger_type}|${r.trigger_key ?? ''}`;
+  const s = escopo(r.surface);
+  const g = escopo(r.goal);
+  return s === '*' && g === '*' ? base : `${base}|${s}|${g}`;
+}
+
+/** Quantas dimensões de escopo a regra amarra. Mais amarrado = mais específico. */
+function scopeSpecificity(r) {
+  return (escopo(r.surface) === '*' ? 0 : 1) + (escopo(r.goal) === '*' ? 0 : 1);
+}
+
+/**
+ * Ordem TOTAL e determinística entre regras que disputam a mesma vaga.
+ *
+ * Cinco critérios, nesta ordem: especificidade do gatilho, especificidade do
+ * campo taxonômico, prioridade, quem foi mexido por último e — para garantir
+ * ordem total — a chave da regra. Sem o último, duas regras empatadas
+ * dependeriam da ordem em que o SELECT devolveu, e um ranking que muda sozinho
+ * é o pior defeito possível aqui.
+ *
+ * Comparação de string com < / > de propósito, nunca `localeCompare`: o ICU do
+ * Worker e o do Node podem divergir e o desempate viraria ambiente-dependente.
+ */
+export function comparePins(a, b) {
+  const sa = PIN_SPECIFICITY[a.trigger_type] || 0;
+  const sb = PIN_SPECIFICITY[b.trigger_type] || 0;
+  if (sa !== sb) return sb - sa;
+
+  const fa = PIN_FIELD_SPECIFICITY[lowerField(a.trigger_field)] || 0;
+  const fb = PIN_FIELD_SPECIFICITY[lowerField(b.trigger_field)] || 0;
+  if (fa !== fb) return fb - fa;
+
+  // Escopo também é especificidade, e desde que ele entrou na PK as duas regras
+  // convivem: `surface: '*'` e `surface: 'cart'` são linhas distintas e ambas
+  // elegíveis num request de carrinho. Sem este critério, quem escreveu por
+  // último ganhava — uma regra curinga nova tomava a vaga de uma regra feita sob
+  // medida para o carrinho, que é o inverso de "mais específico vence".
+  const ea = scopeSpecificity(a);
+  const eb = scopeSpecificity(b);
+  if (ea !== eb) return eb - ea;
+
+  const pa = Number(a.priority) || 0;
+  const pb = Number(b.priority) || 0;
+  if (pa !== pb) return pb - pa;
+
+  const ua = String(a.updated_at ?? '');
+  const ub = String(b.updated_at ?? '');
+  if (ua !== ub) return ua < ub ? 1 : -1; // mais recente primeiro
+
+  const ka = pinKey(a);
+  const kb = pinKey(b);
+  return ka < kb ? -1 : ka > kb ? 1 : 0;
+}
+
+/**
+ * O gatilho da regra casa com este carrinho?
+ *
+ * O taxonômico vale contra o carrinho INTEIRO, não só a âncora — é a mesma
+ * razão de `ruleAffinityOverCart`, e na camada curada ele corrige de graça a
+ * pendência de co-compra registrada acima. Compara sempre por `normTax`: no
+ * seed medido, BODY SPLASH e Body Splash são a MESMA subcategoria.
+ */
+export function pinTriggerMatches(rule, ctx) {
+  switch (rule.trigger_type) {
+    case 'always':
+      return true;
+    case 'sku':
+      return !!ctx.cartSkus && ctx.cartSkus.has(String(rule.trigger_key ?? ''));
+    case 'taxonomy': {
+      const field = lowerField(rule.trigger_field);
+      if (!PIN_TRIGGER_FIELDS.includes(field)) return false;
+      const alvo = normTax(rule.trigger_value);
+      if (!alvo) return false;
+      for (const p of (ctx.cartProds || [])) {
+        if (p && normTax(p[field]) === alvo) return true;
+      }
+      return false;
+    }
+    default:
+      return false;
+  }
+}
+
+/**
+ * Regras cruas → uma vencedora por vaga.
+ *
+ * Puro: sem banco e sem `Date.now()` — o instante entra por `ctx.now`, que é o
+ * que torna o teste de expiração determinístico.
+ *
+ * @param {object[]} rules linhas de pin_rule, sem filtro nenhum
+ * @param {object} ctx { cartSkus:Set, cartProds:object[], surface, goal, slots, now }
+ * @returns {{ bySlot: Map<number,object>, pinnedSkus: Set<string>, discarded: object[] }}
+ */
+export function resolvePins(rules, ctx) {
+  const bySlot = new Map();
+  const pinnedSkus = new Set();
+  const discarded = [];
+  if (!rules || !rules.length) return { bySlot, pinnedSkus, discarded };
+
+  // `assembleSlots` não coloca nada com `n < 1`. Se aqui a regra continuasse
+  // elegível, o produto entraria em `pinnedSkus` e ganharia a dispensa de teto,
+  // de preço mínimo e da faixa de gap — podendo vencer no score — sem nenhum
+  // `pinned` ou `pins` explicando de onde veio a exceção. As duas funções têm
+  // que concordar sobre o que "sem vaga" significa.
+  const slots = Math.floor(Number(ctx.slots) || 0);
+  if (slots < 1) {
+    for (const r of rules) discarded.push({ rule: pinKey(r), why: 'sem_vagas', offer_sku: r.offer_sku ?? null });
+    return { bySlot, pinnedSkus, discarded };
+  }
+  const now = ctx.now || new Date().toISOString();
+  // O escopo é gravado normalizado, mas `surface` chega cru do request: comparar
+  // sem normalizar faz uma regra salva como "PDP" nunca casar com um tema que
+  // pede "PDP", e ela some sem nenhum sinal.
+  const surface = lowerField(ctx.surface) || 'cart';
+  const goal = lowerField(ctx.goal) || 'aov';
+  const fora = (r, why) => { discarded.push({ rule: pinKey(r), why, offer_sku: r.offer_sku ?? null }); };
+
+  const elegiveis = [];
+  for (const r of rules) {
+    const slot = Number(r.slot);
+    if (!Number.isFinite(slot) || slot < 1) { fora(r, 'slot_invalido'); continue; }
+    if (Number(r.active) !== 1) { fora(r, 'pausada'); continue; }
+    if (r.starts_at && String(r.starts_at) > now) { fora(r, 'ainda_nao_comecou'); continue; }
+    if (r.ends_at && String(r.ends_at) < now) { fora(r, 'expirada'); continue; }
+    const escopoSup = lowerField(r.surface);
+    if (escopoSup && escopoSup !== '*' && escopoSup !== surface) { fora(r, 'outra_superficie'); continue; }
+    const escopoGoal = lowerField(r.goal);
+    if (escopoGoal && escopoGoal !== '*' && escopoGoal !== goal) { fora(r, 'outro_goal'); continue; }
+    if (!r.offer_sku) { fora(r, 'sem_offer_sku'); continue; }
+    if (!pinTriggerMatches(r, ctx)) { fora(r, 'gatilho_nao_casou'); continue; }
+
+    // A faixa de vaga é a ÚLTIMA checagem, de propósito. Vaga além do que o
+    // carrinho renderiza não é erro de regra: é regra guardada para quando o
+    // tema mostrar mais ofertas. Checada antes, uma regra pausada na vaga 5
+    // seria relatada como "fora do alcance", o operador aumentaria o `n` do
+    // tema e nada aconteceria — ela estava pausada o tempo todo. Depois de
+    // tudo, só sobra este motivo quando ele é de fato o que impede, e aí o
+    // `n` no detalhe é a diferença entre o simulador e a loja.
+    if (slot > slots) {
+      discarded.push({
+        rule: pinKey(r), why: 'slot_fora_do_alcance', offer_sku: r.offer_sku ?? null,
+        detail: `vaga ${slot} > n=${slots}`,
+      });
+      continue;
+    }
+    elegiveis.push(slot === r.slot ? r : { ...r, slot });
+  }
+
+  elegiveis.sort(comparePins);
+
+  // Uma passada por vaga, em ordem crescente, resolvendo vencedor e
+  // desduplicação de produto JUNTOS.
+  //
+  // Separar as duas coisas perdia regra e mentia no relatório: a vice era
+  // descartada como "vaga já tomada", a vencedora caía depois por já estar
+  // fixada numa vaga menor, e a vaga terminava vazia — com o operador lendo que
+  // uma regra mais específica a tomou, o que era falso, enquanto a regra que
+  // teria funcionado nunca rodava. Agora, se a vencedora cai por duplicidade de
+  // produto, a seguinte assume.
+  const porVaga = new Map();
+  for (const r of elegiveis) {
+    if (!porVaga.has(r.slot)) porVaga.set(r.slot, []);
+    porVaga.get(r.slot).push(r);
+  }
+
+  for (const slot of [...porVaga.keys()].sort((a, b) => a - b)) {
+    let assumiu = false;
+    for (const r of porVaga.get(slot)) {
+      const sku = String(r.offer_sku);
+      if (assumiu) { fora(r, 'vaga_tomada_por_regra_mais_especifica'); continue; }
+      // Mesmo produto vencendo em duas vagas ocupa a MENOR. A alternativa ("a
+      // vaga maior mostra outra coisa do mesmo produto") não existe.
+      if (pinnedSkus.has(sku)) { fora(r, 'produto_ja_fixado_em_vaga_menor'); continue; }
+      bySlot.set(slot, r);
+      pinnedSkus.add(sku);
+      assumiu = true;
+    }
+  }
+
+  return { bySlot, pinnedSkus, discarded };
+}
+
+/**
+ * Monta as vagas sobre um ranking JÁ legítimo.
+ *
+ * Nada chega aqui sem ter passado pelas travas de integridade e pelo piso de
+ * margem: o pin escolhe a ORDEM, nunca a elegibilidade. Vaga cujo produto
+ * fixado não sobreviveu fica aberta e recebe o melhor score restante — e o
+ * relatório diz por quê, senão quem criou a regra vê a oferta "errada" no
+ * carrinho e não tem como descobrir que o motor a barrou.
+ *
+ * Sem regra vencedora nenhuma devolve `scored` intacto, sem sequer marcar os
+ * campos novos: um deploy sem curadoria é inerte, e é isso que o torna seguro.
+ *
+ * Escreve `slot`/`pinned`/`pin_rule` nas ofertas que devolve — elas nascem
+ * dentro de `decide`, que é a única dona.
+ */
+export function assembleSlots(scored, bySlot, rejectedBySku, slots) {
+  if (!bySlot || bySlot.size === 0) return { offers: scored, pins: [] };
+
+  const n = Math.max(0, Number(slots) || 0);
+  const bySku = new Map(scored.map((o) => [o.sku, o]));
+  const usados = new Set();
+  const planejado = new Map();
+  const pins = [];
+
+  for (let s = 1; s <= n; s++) {
+    const r = bySlot.get(s);
+    if (!r) continue;
+    const sku = String(r.offer_sku);
+    const base = {
+      slot_pedido: s, offer_sku: sku, pin_rule: pinKey(r), trigger_type: r.trigger_type,
+    };
+    const oferta = bySku.get(sku);
+    if (oferta && !usados.has(sku)) {
+      usados.add(sku);
+      planejado.set(s, { oferta, base });
+    } else {
+      const rej = rejectedBySku && rejectedBySku.get(sku);
+      // `produto_ja_fixado_em_outra_vaga` não acontece vindo de `decide`:
+      // `resolvePins` já desduplica antes. É a guarda para quem chama
+      // `assembleSlots` direto com um `bySlot` montado à mão — e está coberta
+      // por teste, para não virar código morto sem ninguém notar.
+      pins.push({
+        ...base,
+        slot: s,
+        applied: false,
+        fallback_reason: rej ? rej.code
+          : (oferta ? 'produto_ja_fixado_em_outra_vaga' : 'fora_do_pool'),
+      });
+    }
+  }
+
+  // Vaga pedida além do que o carrinho renderiza. Vindo de `decide` isso não
+  // acontece — `resolvePins` já descarta —, mas um `bySlot` montado à mão é
+  // ponto de entrada declarado, e o laço acima simplesmente nunca visitaria a
+  // regra: ela sumiria sem nenhuma linha no relatório.
+  for (const [s, r] of bySlot) {
+    if (s > n) {
+      pins.push({
+        slot_pedido: s, offer_sku: String(r.offer_sku), pin_rule: pinKey(r),
+        trigger_type: r.trigger_type, slot: null, applied: false,
+        fallback_reason: 'slot_fora_do_alcance',
+      });
+    }
+  }
+
+  const resto = scored.filter((o) => !usados.has(o.sku));
+  const offers = [];
+  const infoPorIndice = new Map();
+  let i = 0;
+  for (let s = 1; s <= n; s++) {
+    const p = planejado.get(s);
+    if (p) {
+      infoPorIndice.set(offers.length, p.base);
+      offers.push(p.oferta);
+    } else if (i < resto.length) {
+      offers.push(resto[i++]);
+    }
+  }
+  while (i < resto.length) offers.push(resto[i++]);
+
+  offers.forEach((o, idx) => {
+    const info = infoPorIndice.get(idx);
+    // A posição final É a vaga. Quando não há oferta suficiente para preencher
+    // as vagas anteriores, o ranking encolhe e o pedido de vaga 3 vira vaga 1 —
+    // o relatório guarda `slot_pedido` para a diferença não ficar invisível.
+    o.slot = idx < n ? idx + 1 : null;
+    o.pinned = !!info;
+    o.pin_rule = info ? info.pin_rule : null;
+    if (info) pins.push({ ...info, slot: o.slot, applied: true, fallback_reason: null });
+  });
+
+  pins.sort((a, b) => (a.slot || 0) - (b.slot || 0) || a.slot_pedido - b.slot_pedido);
+  return { offers, pins };
+}
+
+// ---------------------------------------------------------------------------
 // Decisão completa
 // ---------------------------------------------------------------------------
 
@@ -574,23 +893,44 @@ export function decide(candidates, ctx) {
   const rejected = [];
   const relaxed = [];
 
+  // 0) curadoria. Quem está fixado precisa ser conhecido ANTES dos filtros
+  //    duros, porque o filtro é quem dispensa as travas econômicas.
+  const { bySlot, pinnedSkus, discarded } = resolvePins(ctx.pinRules, ctx);
+  // Sem pin nenhum o ctx não é nem copiado: o caminho comum segue idêntico.
+  const fctx = pinnedSkus.size ? { ...ctx, pinnedSkus } : ctx;
+
   // 1) filtros duros
   let pool = [];
   for (const cand of candidates) {
-    const rej = hardFilterReject(cand, ctx);
+    const rej = hardFilterReject(cand, fctx);
     if (rej) { rejected.push({ sku: cand.sku, ...rej }); continue; }
     pool.push(cand);
   }
 
   // 2) faixa de gap como filtro duro — relaxa se esvaziar o pool, e registra
   if (gapAtivo(ctx.gap, ctx.cartTotal, cfg)) {
-    const banded = pool.filter((c) => inGapBand(c.price, ctx.gap, ctx.cartTotal, cfg.price_cap_ratio)
-      || capExemptByBenefit(c.price, ctx.gap, cfg));
-    if (banded.length) pool = banded;
-    else relaxed.push('gap_band');
+    const naFaixa = (c) => inGapBand(c.price, ctx.gap, ctx.cartTotal, cfg.price_cap_ratio)
+      || capExemptByBenefit(c.price, ctx.gap, cfg);
+    // O relaxamento é decidido sobre os NÃO fixados, e só depois o fixado é
+    // reintroduzido. Duas coisas dependem disso: um pin dentro da faixa
+    // apagaria o sinal `relaxed` dos demais, e um pin sendo o ÚNICO na faixa
+    // esvaziaria as outras vagas — o pool viraria só ele.
+    const comuns = pinnedSkus.size ? pool.filter((c) => !pinnedSkus.has(c.sku)) : pool;
+    const banded = comuns.filter(naFaixa);
+    if (banded.length) {
+      pool = pinnedSkus.size
+        ? banded.concat(pool.filter((c) => pinnedSkus.has(c.sku)))
+        : banded;
+    } else if (comuns.length) {
+      relaxed.push('gap_band');
+    }
+    // `comuns` vazio significa que só havia fixado no pool: a faixa não
+    // derrubou ninguém, então dizer que foi relaxada seria relatar no
+    // decision_log um afrouxamento que nunca aconteceu.
   }
 
-  // 3) score
+  // 3) score. O fixado é pontuado como qualquer outro, inclusive contra o piso
+  //    de margem: o score dele é o que decide onde ele cai se o pin não colar.
   const scored = [];
   for (const cand of pool) {
     const ladder = incentiveLadder(cand, ctx);
@@ -650,6 +990,7 @@ export function decide(candidates, ctx) {
       copy: buildCopy(cand, {
         anchorProd: ctx.anchorProd, gap: ctx.gap, incentive: ladder.incentive,
         urgency, cfg, lineLabels: ctx.lineLabels,
+        pinned: pinnedSkus.has(cand.sku),
       }),
       reason: buildReason([
         ladder.reason,
@@ -672,7 +1013,14 @@ export function decide(candidates, ctx) {
   }
 
   scored.sort((a, b) => b.score - a.score);
-  return { offers: scored, rejected, relaxed };
+
+  // 4) montagem das vagas — a curadoria age AQUI, sobre um ranking legítimo.
+  const rejectedBySku = new Map(rejected.map((r) => [r.sku, r]));
+  const { offers, pins } = assembleSlots(scored, bySlot, rejectedBySku, ctx.slots);
+  // `pinsDiscarded` é o outro lado do `pins`: a regra que existe e NÃO agiu.
+  // Mesma justificativa — sem ele, quem criou a regra não tem como saber se ela
+  // está pausada, expirada, fora de escopo ou simplesmente não casou.
+  return { offers, rejected, relaxed, pins, pinsDiscarded: discarded };
 }
 
 // ---------------------------------------------------------------------------

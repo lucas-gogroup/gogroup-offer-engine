@@ -1,6 +1,8 @@
 # Contrato do offer-api
 
 **Base:** `https://offer-api.devgogroup.com` · app GoDeploy `ed10c7cb`, público
+**Sem bearer:** `POST /recommend`, `POST /event`, `GET /health` — o que a loja usa.
+Todo o resto, inclusive `/offers`, `/log`, `/pins` e `/config`, exige `CURATE_TOKEN`.
 **Marcas:** `barbours`, `rituaria`
 
 O app não lê as bases do grupo. O dado é **empurrado** para ele via `/curate/*`
@@ -83,10 +85,37 @@ no número e o `label` no texto.
   "copy": "Quem levou esse também levou ...",
   "reason": "preço cheio; margem 73%",
   "ttl_seconds": 900,
+  "slot": 1,                     // só quando há curadoria — ver GET /pins
+  "pinned": false,               // true = esta oferta veio de regra humana
+  "pin_rule": null,              // "1|sku|RT01008" quando pinned
   "context": { "anchor": "RT01008", "cart_total": 89.9, "gap": 0, "threshold_label": null, ... },
   "latency_ms": 307
 }
 ```
+
+**Sem nenhuma regra de curadoria ativa, `slot`, `pinned`, `pin_rule` e `pins` não
+aparecem** — o payload é byte a byte o de sempre. É o que torna o deploy desta
+feature inerte enquanto ninguém cria regra.
+
+`pins` no `/recommend` traz **só as regras que de fato ocuparam uma vaga**. As que
+não colaram carregam o SKU que a marca queria empurrar e o código interno que o
+barrou — e esta rota é pública. Isso reduz o que a curadoria acrescenta de
+exposição, mas **não** torna o `/recommend` discreto: o objeto de cada oferta já
+publicava `expected_margin`, `score` e `available` antes desta feature, e segue
+publicando. Fechar isso mexe no contrato que o tema consome e está anotado como
+decisão separada. Para diagnóstico use `debug: true`, o `/offers`
+ou o `/log`; o tema não precisa, porque cada oferta já diz `pinned`, `slot` e
+`pin_rule`.
+
+> **`/offers`, `/log` e `/pins` passaram a exigir bearer.** Eram abertas, e não
+> dava para sustentar: `/log` devolvia a margem esperada por produto, o preço, o
+> score e o carrinho de shoppers reais para qualquer um na internet, e as três
+> passaram a carregar o relatório de curadoria. Filtrar o `/recommend` com
+> cuidado era teatro enquanto um GET vizinho entregava tudo.
+>
+> A loja **não** é afetada: o tema chama só `POST /recommend` e `POST /event`,
+> que seguem públicos, e o `/health` também. Quem lê diagnóstico é você pelo
+> terminal e o painel, que proxia com o token no servidor.
 
 **Sem oferta válida:** HTTP 200 com `offers: []` e `reason` explicando
 (ex.: `"sem oferta: over_price_cap=73, kit_contains_cart_sku=14"`).
@@ -138,6 +167,22 @@ Realimenta o bandit **no próprio request** — sem cron, sem janela de 15 min.
 `reject` é registrado no log mas não mexe em contador: recusa já está implícita
 em `impressions − accepts`, e contar de novo seria contar duas vezes.
 
+### Oferta curada vai para um braço separado
+
+Evento sobre uma oferta que saiu por curadoria é contabilizado em
+`offer_stats` com `segment` igual a `<segmento>|pin`. O `/recommend` liga o
+`segment` cru do request, então **essas linhas nunca voltam para o amostrador**.
+
+Não é higiene. O pin injeta exposição forçada, quase sempre na vaga 1, que
+converte melhor por **posição** e não por mérito. Misturado, um pin de 30 dias
+deixaria a posterior daquele braço tão dominante que o bandit continuaria
+escolhendo o mesmo SKU depois de a regra expirar — o pin sobreviveria à própria
+expiração, e desligar a curadoria não mudaria nada.
+
+O braço `|pin` continua sendo gravado porque é o que permite defender ou matar
+uma regra com número: *"este pin converte a 4,2% em 1.800 impressões; o orgânico
+da mesma âncora roda a 11,1%"*.
+
 ---
 
 ## `GET /offers?brand=&anchor=`
@@ -151,10 +196,175 @@ Simulação: o ranking de uma âncora sem montar carrinho.
 | `n` | 10 | até 50 |
 | `gap`, `max_discount` | — | |
 | `gifts` | — | SKUs separados por vírgula |
+| `cart` | — | SKUs separados por vírgula: monta carrinho de teste com vários itens |
+| `no_pins` | 0 | `1` ignora a curadoria — o ranking do motor puro |
 | `debug` | 0 | `1` traz a lista de rejeitados com motivo |
 
+`debug` no `POST /recommend` **só é honrado com o bearer**. O campo vem do corpo
+numa rota pública: aceitá-lo de qualquer um devolveria pela porta da frente a
+lista de rejeitados e o relatório de curadoria que fechar `/offers` e `/log`
+tirou da porta dos fundos. Sem token ele é ignorado, e a loja não sente nada.
+
 O carrinho simulado é a própria âncora pelo preço real do catálogo — então o
-teto de 60% se aplica sobre ele.
+teto de 60% se aplica sobre ele. Com `cart`, os SKUs extras entram pelo preço do
+catálogo; SKU desconhecido entra a zero e não distorce o total.
+
+Como a âncora é o item de maior valor, `cart` pode trocá-la — a resposta traz
+`anchor_effective` além do `anchor` pedido.
+
+Rodar a mesma chamada com e sem `no_pins=1` mostra lado a lado o que a curadoria
+mudou. É a base do simulador do painel.
+
+---
+
+## `GET /pins?brand=` · `POST /pins` (bearer) · `POST /pins/delete` (bearer)
+
+Curadoria manual: fixa um produto numa **vaga** do carrinho. Vaga é a posição na
+lista que o `/recommend` devolve — com `n=3`, o carrinho tem as vagas 1, 2 e 3.
+
+### O que o pin pode e não pode
+
+O pin dispensa **apenas as travas econômicas**: teto de preço, faixa de gap e
+preço mínimo. Ele **não** dispensa, em hipótese nenhuma:
+
+`sku_in_cart` · `kit_contains_cart_sku` · `kit_overlaps_cart_kit` ·
+`component_of_cart_kit` · `sku_is_gift` · `gift_functional_equivalent` ·
+`out_of_stock` · `no_price` · `no_cogs` · `no_variant_id` · `below_margin_floor`
+
+Quando a regra casa mas o produto bate numa dessas, a vaga cai no ranking normal
+e o `pins[]` da resposta diz qual código barrou. Sem isso, quem criou a regra
+veria a oferta "errada" no carrinho sem nenhuma forma de descobrir o motivo.
+
+### Forma da regra
+
+```jsonc
+{
+  "brand": "rituaria",
+  "slot": 1,                       // 1..10
+  "trigger_type": "always | sku | taxonomy",
+  "trigger_sku": "RT01008",        // quando trigger_type=sku
+  "trigger_field": "category | subcategory | line",  // quando taxonomy
+  "trigger_value": "Fórmulas",     // gravado normalizado (acento/caixa)
+  "offer_sku": "KRT99078",         // o produto que ocupa a vaga
+  "surface": "*", "goal": "*",     // escopo; "*" vale para todos
+  "priority": 0,
+  "active": 1,
+  "starts_at": null,
+  "ends_at": "2026-12-31",         // data pura vira o FIM do dia em BRT
+  "note": "campanha de fim de ano"
+}
+```
+
+**Fuso das datas.** `2026-12-31` vira o fim do dia em BRT; `2026-12-31T23:59`
+(o que um `datetime-local` manda) também é lido como BRT, e não no fuso da
+máquina que gravou — senão o mesmo texto viraria instantes diferentes vindo do
+Worker ou do computador de quem opera. Com `Z` ou `±HH:MM` explícito, o fuso
+informado é respeitado.
+
+O gatilho `taxonomy` casa contra o **carrinho inteiro**, não só a âncora.
+
+### Precedência, quando duas regras disputam a mesma vaga
+
+Quanto mais específico o "se", mais forte a regra:
+
+1. `sku` > `taxonomy` > `always`
+2. dentro de `taxonomy`: `subcategory` > `line` > `category`
+3. escopo amarrado > curinga (`surface`/`goal` exatos vencem `*`)
+4. `priority` maior
+5. `updated_at` mais recente
+6. chave da regra (garante ordem total — o ranking nunca muda sozinho)
+
+`priority` **não** atravessa especificidade: um `always` com prioridade 99
+continua perdendo de um gatilho por SKU. Para inverter, pause a regra mais
+específica. O mesmo produto vencendo em duas vagas ocupa a **menor**.
+
+### Chamadas
+
+`GET /pins?brand=&slot=&active=&surface=&goal=` (bearer) — é o plano de
+merchandising da marca mais o estado do estoque, então não é aberto. Devolve as
+regras mais o estado calculado: `expired`, `not_started`, `effective`,
+`offer_in_catalog` (avisa regra apontando para SKU que não existe) e
+`pinned_product_performance`, que lê o braço `|pin` do bandit.
+
+Esse número é **do produto fixado**, não da regra: `offer_stats` tem marca,
+âncora, superfície, goal e segmento — não tem vaga nem gatilho. Duas regras que
+fixam o mesmo SKU no mesmo escopo compartilham o total. O `take_rate` só vem
+preenchido a partir de 300 impressões; abaixo disso a taxa mente, e é na cauda
+que ela aparece.
+
+Filtrar por `surface`/`goal` inclui as regras **curinga**, porque elas também
+governam aquele escopo — e é só com o recorte que a ordem da lista responde
+"qual regra manda no carrinho". Sem ele, a lista agrupa por escopo, já que
+regras de superfícies diferentes nunca disputam entre si. Dentro de
+cada vaga a lista vem **na ordem da disputa**, usando o mesmo comparador do
+motor — a primeira é a que venceria.
+
+`POST /pins` (bearer) — grava **uma** regra, com **edição parcial**. A identidade
+é `brand` + `slot` + `trigger_type` + o gatilho (`trigger_sku`, ou
+`trigger_field` + `trigger_value`) + `surface` + `goal`. O escopo faz parte da
+identidade de propósito: é o que permite "vaga 1 = A no carrinho" e "vaga 1 = B
+na PDP" coexistirem. Regra criada com escopo explícito precisa ser identificada
+com ele; quem não usa escopo cai em `*` nos dois e não percebe diferença. Se a regra já existe, só os campos enviados
+mudam, num `UPDATE` das colunas informadas — então duas edições simultâneas de
+campos diferentes não se atropelam. Por isso pausar é só `{"active": 0}` junto da
+identidade, sem perder vigência, escopo, prioridade nem nota.
+
+Editáveis desta forma: `offer_sku`, `priority`, `active`, `starts_at`,
+`ends_at`, `note`. **Vaga, gatilho e escopo não**, porque são a identidade —
+mudá-los é criar outra regra e apagar a antiga.
+
+`active`, `priority`, `starts_at` e `ends_at` recusam string vazia: é o que um
+formulário manda no campo não tocado, e aceitá-la despausaria a regra, zeraria o
+desempate ou tornaria eterna uma campanha com data de fim, sempre em silêncio.
+Para limpar uma data, mande `null` explícito.
+
+A resposta traz `created` dizendo se foi criação ou edição, e `warnings` quando
+`offer_sku` ou `trigger_sku` não estão no catálogo da marca. O casamento por SKU
+é **exato**: um código com a grafia errada nunca dispara e aparece só como
+`gatilho_nao_casou`, indistinguível de um carrinho que legitimamente não bate —
+por isso o aviso na escrita. Regra inválida volta `400 invalid_rule` com um
+`detail` legível; um corpo só com a identidade volta `400 nothing_to_update`.
+
+`POST /pins/delete` (bearer) — `{brand, slot, trigger_type, trigger_sku}` remove
+uma regra; `{brand, slot}` limpa a vaga inteira, e aceita `surface`/`goal` para
+recortar por escopo. A resposta lista o que apagou: num delete por vaga,
+"apagou 3" não diz se levou junto a regra de outra superfície. **Devolve `404 rule_not_found`
+quando nada casou** — apagar nada e responder ok faria o operador acreditar que
+removeu enquanto a regra segue decidindo o carrinho. É POST porque o CORS do app
+só libera `GET, POST, OPTIONS`.
+
+`POST /curate/pins` (bearer) — carga em lote, no formato dos outros `/curate`.
+Diferente do `POST /pins`, aqui é **substituição total** da linha: campo que não
+vier volta ao default. A exceção é `created_at`, preservado no re-push — não é
+campo que alguém digita, e carimbá-lo a cada "salvar tudo" apagaria o instante
+real de criação de todas as regras. Erros saem por
+linha em `errors[]` sem derrubar o lote. E
+`POST /curate/reset?table=pins&brand=` zera antes de recarregar.
+
+`active` aceita o que uma exportação de planilha produz — `1/0`, `true/false`,
+`sim/não`, `yes/no`, `y/n`, `t/f`, `on/off`, em qualquer caixa — e **recusa** o
+que não reconhece, em vez de assumir "pausada" em silêncio.
+
+### Por que uma regra não apareceu
+
+Regra **pausada não viaja no `/recommend`**: campanha desligada não decide nada,
+e o carrinho não pode carregar a cada request toda regra que a marca já
+aposentou. O simulador recebe todas, porque é lá que "por que minha regra não
+apareceu?" é a pergunta.
+
+`GET /offers` devolve sempre `pins_discarded`, com o motivo de cada regra que
+existe e não agiu, em ordem de precedência da checagem: `slot_invalido`,
+`sem_vagas`, `pausada`, `expirada`, `ainda_nao_comecou`, `outra_superficie`,
+`outro_goal`, `sem_offer_sku`, `gatilho_nao_casou`, `slot_fora_do_alcance`,
+`vaga_tomada_por_regra_mais_especifica`, `produto_ja_fixado_em_vaga_menor`.
+A vaga é a **última** checagem de propósito: uma regra pausada na vaga 5 relatada
+como "fora do alcance" faria o operador aumentar o `n` do tema para nada. No `/recommend` isso só sai com `debug: true` —
+no carrinho seria uma lista por regra pausada em toda requisição.
+
+> **Simule com o mesmo `n` da loja.** O `/offers` usa `n=10` por padrão e o tema
+> pede bem menos. Uma regra na vaga 3 age no simulador e **não** age num
+> `/recommend` com `n: 1` — o descarte `slot_fora_do_alcance` traz o `n` no
+> `detail` justamente para isso não passar batido.
 
 ---
 
@@ -176,7 +386,7 @@ linha com **contexto, decisão e motivo** — inclusive quando não há oferta.
 
 ---
 
-## `GET /config?brand=` · `POST /config` (bearer)
+## `GET /config?brand=` (bearer) · `POST /config` (bearer)
 
 Pisos e tetos por marca, **em runtime, sem redeploy**.
 

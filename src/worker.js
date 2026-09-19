@@ -11,6 +11,8 @@
 //   GET  /offers?brand&anchor         simulação: ranking para uma âncora
 //   GET  /log?brand&limit             decision_log (autonomia visível)
 //   GET  /config?brand  POST /config  pisos/tetos por marca, sem redeploy
+//   GET  /pins?brand    POST /pins    curadoria: fixa produto numa vaga (bearer p/ escrita)
+//   POST /pins/delete                 remove regra de curadoria (bearer)
 //   POST /curate/:table               carga (bearer)
 //   POST /curate/reset?table=         zera antes de recarga (bearer)
 
@@ -18,6 +20,7 @@ import { adaptDb, ensureSchema } from './db.js';
 import {
   decide, mergeConfig, functionalKey, round2, DEFAULT_CONFIG,
   parseCollectible, normTax, hashSeed, rngFrom, tsWindow,
+  PIN_SPECIFICITY, PIN_TRIGGER_FIELDS, comparePins,
 } from './engine.js';
 
 const DEFAULT_ORIGINS = [
@@ -28,7 +31,7 @@ const DEFAULT_ORIGINS = [
 ];
 
 const CURATE_TABLES = new Set([
-  'product', 'kits', 'affinity', 'sku_orders', 'brand_orders', 'prior',
+  'product', 'kits', 'affinity', 'sku_orders', 'brand_orders', 'prior', 'pins',
 ]);
 
 export default {
@@ -46,7 +49,13 @@ export default {
       for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);
       return res;
     } catch (err) {
-      return json({ error: String(err && err.message || err), stack: err && err.stack }, 500, cors);
+      // O stack só com bearer, como o `debug`. Ele saía no corpo de qualquer
+      // 500 numa API pública — e era o que transformava cada entrada sem teto
+      // num vazamento, motivando limites apertados no lugar errado.
+      return json({
+        error: String(err && err.message || err),
+        stack: autorizado(request, env) ? err && err.stack : undefined,
+      }, 500, cors);
     }
   },
 };
@@ -56,12 +65,35 @@ async function route(request, url, db, env) {
   const m = request.method;
 
   if (p === '/' || p === '/health') return handleHealth(db);
-  if (p === '/recommend' && m === 'POST') return handleRecommend(request, db);
+  if (p === '/recommend' && m === 'POST') return handleRecommend(request, db, env);
   if (p === '/event' && m === 'POST') return handleEvent(request, db);
-  if (p === '/offers' && m === 'GET') return handleOffers(url, db);
-  if (p === '/log' && m === 'GET') return handleLog(url, db);
-  if (p === '/config' && m === 'GET') return handleGetConfig(url, db);
+  // Rotas de DIAGNÓSTICO, agora atrás do bearer.
+  //
+  // Eram abertas, e não dava mais para sustentar isso. `/log` devolve, para
+  // qualquer um na internet, a margem esperada por produto, o preço, o score e
+  // o carrinho de shoppers reais; `/offers` devolve o mesmo por âncora, com a
+  // lista de rejeitados; e as duas passaram a carregar o relatório de curadoria
+  // — o SKU que a marca quer empurrar e o código interno que o barrou.
+  //
+  // O `/recommend` é filtrado com cuidado justamente para não publicar isso, e
+  // essa proteção era teatro enquanto um GET vizinho entregava tudo. A loja não
+  // usa nenhuma das duas: o tema chama só /recommend e /event, que seguem
+  // públicos.
+  if (p === '/offers' && m === 'GET') return guard(request, env, () => handleOffers(url, db));
+  if (p === '/log' && m === 'GET') return guard(request, env, () => handleLog(url, db));
+  // `/config` também: devolve `margin_floor`, os tetos de preço, os priors e o
+  // mapa de rótulos internos de linha — a mesma classe de dado econômico que
+  // justificou fechar `/offers` e `/log`. Deixá-lo aberto era a última fresta.
+  if (p === '/config' && m === 'GET') return guard(request, env, () => handleGetConfig(url, db));
   if (p === '/config' && m === 'POST') return guard(request, env, () => handleSetConfig(request, db));
+  // Curadoria. A leitura também é fechada: é o plano de merchandising da marca
+  // mais o estado do estoque. DELETE seria o verbo certo, mas o CORS do app
+  // libera GET/POST/OPTIONS, e /curate/reset já firmou esse padrão.
+  if (p === '/pins' && m === 'GET') return guard(request, env, () => handleListPins(url, db));
+  if (p === '/pins' && m === 'POST') return guard(request, env, () => handleSetPin(request, db));
+  if (p === '/pins/delete' && m === 'POST') return guard(request, env, () => handleDeletePin(request, db));
+  // Retenção do decision_log. Fechada: apaga dado, e é o que a cron chama.
+  if (p === '/prune' && m === 'POST') return guard(request, env, () => handlePrune(request, url, db));
   if (p === '/curate/reset' && m === 'POST') return guard(request, env, () => handleReset(url, db));
   if (p.startsWith('/curate/') && m === 'POST') {
     const table = p.slice('/curate/'.length);
@@ -76,7 +108,7 @@ async function route(request, url, db, env) {
 
 async function handleHealth(db) {
   const counts = {};
-  for (const t of ['product', 'kit_components', 'affinity', 'sku_orders', 'brand_orders', 'offer_stats', 'decision_log']) {
+  for (const t of ['product', 'kit_components', 'affinity', 'sku_orders', 'brand_orders', 'offer_stats', 'decision_log', 'pin_rule']) {
     counts[t] = (await db.all(`SELECT COUNT(*) AS n FROM ${t}`))[0].n;
   }
   const perBrand = await db.all(
@@ -94,16 +126,29 @@ async function handleHealth(db) {
 // /recommend
 // ---------------------------------------------------------------------------
 
-async function handleRecommend(request, db) {
+async function handleRecommend(request, db, env) {
   const t0 = Date.now();
   const body = await readJson(request);
   const brand = normBrand(body.brand);
   if (!brand) return json({ error: 'brand_required' }, 400);
 
+  // `debug` abre a lista de rejeitados, os tempos e o relatório de curadoria
+  // completo — o SKU que a marca quer empurrar e o código que o barrou. Como
+  // esta rota é pública e o campo vem do CORPO, aceitá-lo de qualquer um
+  // devolveria pela porta da frente tudo que fechar /offers e /log tirou da
+  // porta dos fundos. Só vale com o bearer; sem ele é ignorado, e a loja segue
+  // funcionando normalmente.
+  const debug = !!body.debug && autorizado(request, env);
+
   const surface = body.surface || 'cart';
   const goal = ['aov', 'stock', 'margin'].includes(body.goal) ? body.goal : 'aov';
   const segment = body.customer && body.customer.is_returning ? 'returning' : 'new';
   const n = Math.max(1, Math.min(10, Number(body.n) || 1));
+  // O carrinho entra INTEIRO. O limite de binds do SQLite é problema da query,
+  // e é lá que ele é tratado — cortar aqui tirava SKU do `cartSkus`, e com ele
+  // as travas de integridade: um kit na posição 110 de um carrinho de 120 linhas
+  // deixava de barrar o próprio kit, que é precisamente a falha que o PORTÃO
+  // existe para impedir. Brinde então nem chega a virar bind.
   const cart = Array.isArray(body.cart) ? body.cart : [];
   const gifts = Array.isArray(body.gifts) ? body.gifts : [];
 
@@ -114,13 +159,28 @@ async function handleRecommend(request, db) {
     threshold: body.threshold ?? null,
     maxDiscount: body.max_discount ?? DEFAULT_CONFIG.max_discount,
     priceTarget: body.price_target ?? null,
-    debug: !!body.debug,
+    debug,
     agent: 'ofertante',
   });
 
   out.latency_ms = Date.now() - t0;
   if (!out.offers.length) {
-    return json({ ...out, offer_id: out.offer_id, offers: [], reason: out.reason }, 200);
+    // Forma explícita, não `...out`: o espalhamento publicava o objeto interno
+    // inteiro — a lista de rejeitados, os tempos e, depois desta feature, o
+    // relatório de curadoria com cada regra, seu produto e o motivo de não ter
+    // agido — numa rota pública e sem debug.
+    return json({
+      offer_id: out.offer_id,
+      offers: [],
+      reason: out.reason,
+      context: out.context,
+      relaxed: out.relaxed.length ? out.relaxed : undefined,
+      rejected: out.debug ? out.rejected : undefined,
+      pins: pinsPublicaveis(out),
+      pins_discarded: out.debug && out.pinsDiscarded.length ? out.pinsDiscarded : undefined,
+      timings: out.debug ? out.timings : undefined,
+      latency_ms: out.latency_ms,
+    }, 200);
   }
   const top = out.offers[0];
   return json({
@@ -129,6 +189,10 @@ async function handleRecommend(request, db) {
     ttl_seconds: 900,
     offers: n > 1 ? out.offers : undefined,
     context: out.context,
+    pins: pinsPublicaveis(out),
+    // O descarte só sai em debug: no carrinho ele seria uma lista por regra
+    // pausada ou fora de gatilho em TODA requisição, e o tema não usa.
+    pins_discarded: out.debug && out.pinsDiscarded.length ? out.pinsDiscarded : undefined,
     relaxed: out.relaxed.length ? out.relaxed : undefined,
     rejected: out.debug ? out.rejected : undefined,
     timings: out.debug ? out.timings : undefined,
@@ -164,7 +228,12 @@ async function runDecision(db, opts) {
   // chamada, o que colocava o /recommend em ~1 s. Agora a afinidade, os
   // denominadores e os contadores do bandit vêm juntos com o candidato, e de
   // kits só se lê o que o carrinho realmente toca.
-  const cartList = [...cartSkus];
+  // O teto vive AQUI, sobre a lista que vira bind — não sobre o carrinho.
+  // `cartSkus` segue inteiro e é o que o `hardFilterReject` usa para
+  // `sku_in_cart`, então nenhuma trava de integridade perde contexto por
+  // tamanho. Só as subqueries de kit, que precisam de `IN (?, …)`, param no
+  // limite: cada SKU entra três vezes, e 999 é o teto de variáveis do SQLite.
+  const cartList = [...cartSkus].slice(0, MAX_CART_BINDS);
   const inCart = cartList.map(() => '?').join(',');
 
   // Duas leituras, não cinco. O que o candidato precisa — afinidade com a
@@ -208,6 +277,18 @@ async function runDecision(db, opts) {
   // Os `?` ligam na ordem em que aparecem no TEXTO: as subqueries de kit estão
   // na cláusula SELECT, portanto antes de todos os JOIN. Inverter isso faz a
   // afinidade voltar zerada em silêncio, sem erro de SQL.
+  //
+  // É por isso que as regras de curadoria vêm por um LEFT JOIN agregado com
+  // ZERO parâmetro, correlacionado por `pr.brand = p.brand`. Um `?` de DATA ali
+  // entraria no meio dessa ordem e zeraria a afinidade sem avisar — e validade
+  // é regra de negócio, que pertence ao engine, testável sem banco.
+  //
+  // `active = 1` é literal, não tem bind e não mexe na ordem, então esse fica no
+  // SQL: regra pausada não decide nada e o carrinho não pode carregar, a cada
+  // request e para sempre, toda campanha que a marca já desligou. O simulador
+  // pede `pinsAll` e recebe tudo, porque lá o motivo "pausada" é a resposta.
+  // Agregar por marca (em vez de subquery correlacionada na cláusula SELECT)
+  // também evita reavaliar o group_concat nas 241 linhas do catálogo.
   const prodParams = [];
   if (cartList.length) prodParams.push(...cartList, ...cartList, ...cartList);
   prodParams.push(anchor || '', anchor || '', surface, goal, segment, anchor || '', brand);
@@ -227,6 +308,8 @@ async function runDecision(db, opts) {
             ${compHit}    AS comp_hit,
             bo.n_orders AS brand_orders,
             ao.n_orders AS anchor_orders,
+            CASE WHEN p.sku = (SELECT MIN(p2.sku) FROM product p2 WHERE p2.brand = p.brand)
+                 THEN pr.wire END AS pin_rules,
             ${cfgCols.map((c) => `bc.${c} AS cfg_${c}`).join(',\n            ')}
        FROM product p
        LEFT JOIN affinity a
@@ -239,6 +322,21 @@ async function runDecision(db, opts) {
        LEFT JOIN brand_orders bo ON bo.brand = p.brand
        LEFT JOIN sku_orders   ao ON ao.brand = p.brand AND ao.sku = ?
        LEFT JOIN brand_config bc ON bc.brand = p.brand
+       LEFT JOIN (
+         SELECT brand, group_concat(
+                  slot         || char(31) || offer_sku    || char(31) ||
+                  trigger_type || char(31) || trigger_key  || char(31) ||
+                  COALESCE(trigger_field, '') || char(31) ||
+                  COALESCE(trigger_value, '') || char(31) ||
+                  COALESCE(surface, '*')     || char(31) ||
+                  COALESCE(goal, '*')        || char(31) ||
+                  active       || char(31) ||
+                  COALESCE(starts_at, '')    || char(31) ||
+                  COALESCE(ends_at, '')      || char(31) ||
+                  priority     || char(31) ||
+                  COALESCE(updated_at, ''), char(30)) AS wire
+           FROM pin_rule ${opts.pinsAll ? '' : 'WHERE active = 1'} GROUP BY brand
+       ) pr ON pr.brand = p.brand
       WHERE p.brand = ?`,
     prodParams,
   );
@@ -316,10 +414,22 @@ async function runDecision(db, opts) {
   const win = tsWindow();
   const rndFor = (sku) => rngFrom(hashSeed(`${brand}|${sku}|${surface}|${goal}|${segment}|${win}`));
 
+  // Curadoria. `no_pins` existe para o simulador do painel mostrar, lado a
+  // lado, o ranking com e sem intervenção humana — é o que permite defender ou
+  // matar uma regra olhando a tela.
+  // O wire vem em UMA linha só, não em todas. A config se repete nas 241 linhas
+  // a custo desprezível (24 escalares), mas a serialização das regras é um blob:
+  // com algumas dezenas de regras seriam megabytes materializados por request,
+  // num motor que já gasta ~115 ms por query. O `CASE` da query prende o blob na
+  // primeira linha da marca, e aqui se procura por ele em vez de assumir a
+  // posição — `products` não tem ORDER BY.
+  const pinRules = opts.noPins ? [] : parsePinRules(products.find((p) => p.pin_rules)?.pin_rules);
+
   const ctx = {
     cfg, cartSkus, giftSkus, giftKeys, cartTotal, kitComponentsOf,
     cartKitComponents, gap, thresholdLabel, goal, priceTarget, maxDiscount, anchorProd,
     cartProds, collectible, lineLabels, rndFor,
+    pinRules, slots: n, surface, now: new Date().toISOString(),
     affinityOf: (sku) => {
       const p = bySku.get(sku);
       return { co: p?.co || 0, anchorOrders, candOrders: p?.cand_orders || 0, brandOrders };
@@ -336,9 +446,14 @@ async function runDecision(db, opts) {
   };
 
   const tDecide0 = Date.now();
-  const { offers, rejected, relaxed } = decide(products, ctx);
+  const { offers, rejected, relaxed, pins, pinsDiscarded } = decide(products, ctx);
   const tDecide = Date.now() - tDecide0;
   const top = offers.slice(0, n).map((o) => (debug ? o : stripDebug(o)));
+
+  // Só os fixados que REALMENTE saíram, e só entre os devolvidos: é o que o
+  // /event precisa para separar o braço do bandit. Sem curadoria os campos não
+  // aparecem, e o decision_log fica idêntico ao que já era.
+  const pinnedSkus = top.filter((o) => o.pinned).map((o) => o.sku);
 
   const offerId = 'of_' + randomId();
   const context = {
@@ -346,12 +461,21 @@ async function runDecision(db, opts) {
     threshold_label: thresholdLabel,
     cart_skus: [...cartSkus], gift_skus: [...giftSkus],
     pool_size: products.length, candidates_after_filters: offers.length,
+    // Aplicadas, não "casaram": três regras podem casar com o carrinho e as
+    // três serem barradas por integridade. Contar tentativa faria quem audita o
+    // log concluir que a curadoria agiu quando nenhuma oferta curada saiu.
+    ...(pins.length ? {
+      slots: n,
+      pin_rules_applied: pins.filter((p) => p.applied).length,
+      pin_rules_barred: pins.filter((p) => !p.applied).length,
+    } : {}),
   };
   const decision = top.length
     ? { offer_sku: top[0].sku, variant_id: top[0].variant_id, price: top[0].price,
         final_price: top[0].final_price, incentive: top[0].incentive, score: top[0].score,
-        expected_margin: top[0].expected_margin, alternatives: top.slice(1).map((o) => o.sku) }
-    : { offer_sku: null };
+        expected_margin: top[0].expected_margin, alternatives: top.slice(1).map((o) => o.sku),
+        ...(pins.length ? { pins, pinned_skus: pinnedSkus } : {}) }
+    : { offer_sku: null, ...(pins.length ? { pins } : {}) };
   const reason = top.length
     ? top[0].reason
     : `sem oferta: ${rejectSummary(rejected) || 'pool vazio'}`;
@@ -366,12 +490,65 @@ async function runDecision(db, opts) {
   const tLog = Date.now() - tLog0;
 
   return {
-    offer_id: offerId, offers: top, rejected, relaxed, context, reason, debug,
+    offer_id: offerId, offers: top, rejected, relaxed, pins, pinsDiscarded, n,
+    context, reason, debug,
     timings: { query_ms: tQuery, decide_ms: tDecide, log_ms: tLog, rows: products.length },
   };
 }
 
 function stripDebug(o) { const { _debug, ...rest } = o; return rest; }
+
+/**
+ * O relatório de curadoria que pode sair numa rota pública.
+ *
+ * As entradas `applied: false` são as interessantes para quem opera e as piores
+ * para publicar: trazem o SKU que a marca QUERIA empurrar e o código interno que
+ * o barrou (`below_margin_floor`, `over_price_cap`, `out_of_stock`). Qualquer
+ * shopper enumeraria o plano de merchandising e o estado do estoque.
+ *
+ * O tema não precisa delas: cada oferta já carrega `pinned`, `slot` e
+ * `pin_rule`. Diagnóstico é o `debug: true` e o simulador.
+ */
+function pinsPublicaveis(out) {
+  if (out.debug) return out.pins.length ? out.pins : undefined;
+  const aplicados = out.pins.filter((p) => p.applied);
+  return aplicados.length ? aplicados : undefined;
+}
+
+// Ordem dos campos no `wire` do group_concat. Uma constante só, ao lado da
+// query, porque isto é serialização — não decisão. `char(31)` (unit separator)
+// e `char(30)` (record separator) não aparecem em SKU nem em rótulo de
+// taxonomia, e `pinTuple` recusa na escrita qualquer valor que os contenha —
+// que é o único ponto onde dá para avisar alguém. (`sqlLiteral` NÃO cobre isso:
+// ele só recusa `\u0000`, e o caminho de /pins nem passa por ele.)
+const PIN_WIRE = ['slot', 'offer_sku', 'trigger_type', 'trigger_key', 'trigger_field',
+  'trigger_value', 'surface', 'goal', 'active', 'starts_at', 'ends_at', 'priority',
+  'updated_at'];
+const PIN_WIRE_NUM = new Set(['slot', 'active', 'priority']);
+// `trigger_key` fica fora: '' é o valor legítimo do gatilho `always`, e virar
+// null aqui faria `pinKey` e a comparação de gatilho lidarem com dois vazios.
+const PIN_WIRE_NULLABLE = new Set(['trigger_field', 'trigger_value', 'starts_at',
+  'ends_at', 'updated_at']);
+
+function parsePinRules(wire) {
+  if (!wire) return [];
+  const out = [];
+  for (const rec of String(wire).split('\u001e')) {
+    if (!rec) continue;
+    const parts = rec.split('\u001f');
+    // Registro com contagem errada é dado corrompido, não regra: descartar é
+    // mais seguro que adivinhar qual campo faltou.
+    if (parts.length !== PIN_WIRE.length) continue;
+    const r = {};
+    PIN_WIRE.forEach((k, i) => {
+      const v = parts[i];
+      if (PIN_WIRE_NUM.has(k)) r[k] = Number(v);
+      else r[k] = PIN_WIRE_NULLABLE.has(k) && v === '' ? null : v;
+    });
+    out.push(r);
+  }
+  return out;
+}
 
 /** `line_labels` da config: JSON {linha: rótulo público} com a chave normalizada. */
 function parseLineLabels(raw) {
@@ -405,10 +582,28 @@ async function handleOffers(url, db) {
   if (!brand) return json({ error: 'brand_required' }, 400);
   if (!anchor) return json({ error: 'anchor_required' }, 400);
 
-  const anchorRow = (await db.all('SELECT * FROM product WHERE brand = ? AND sku = ?', [brand, anchor]))[0];
-  const cart = anchorRow
-    ? [{ sku: anchor, variant_id: anchorRow.variant_id, qty: 1, price: anchorRow.price }]
-    : [{ sku: anchor, qty: 1, price: Number(q.get('anchor_price')) || 0 }];
+  // `cart=` monta um carrinho de teste com vários itens. Sem isso não dá para
+  // simular gatilho taxonômico — que casa contra o carrinho inteiro, não só a
+  // âncora — e é justamente o caso mais difícil de acertar de cabeça.
+  // Limitado como todo o resto do arquivo (`n` em 50, `limit` em 500): sem teto,
+  // uma lista de mil SKUs vira um `IN (?, ?, …)` acima do máximo de variáveis do
+  // SQLite, o erro sobe para o catch do topo e o 500 devolve o stack.
+  const extras = (q.get('cart') || '').split(',')
+    .map((s) => s.trim()).filter(Boolean).filter((s) => s !== anchor);
+  const querSkus = [anchor, ...new Set(extras)].slice(0, MAX_CART_SIM);
+  const rows = await db.all(
+    `SELECT * FROM product WHERE brand = ? AND sku IN (${querSkus.map(() => '?').join(',')})`,
+    [brand, ...querSkus],
+  );
+  const porSku = new Map(rows.map((r) => [r.sku, r]));
+  const anchorRow = porSku.get(anchor) || null;
+  const cart = querSkus.map((sku) => {
+    const r = porSku.get(sku);
+    if (r) return { sku, variant_id: r.variant_id, qty: 1, price: r.price };
+    // SKU desconhecido só entra com preço quando é a âncora e o chamador o
+    // informou; um extra fantasma entra a zero e não distorce o total.
+    return { sku, qty: 1, price: sku === anchor ? Number(q.get('anchor_price')) || 0 : 0 };
+  });
 
   const out = await runDecision(db, {
     brand,
@@ -424,15 +619,30 @@ async function handleOffers(url, db) {
     debug: q.get('debug') === '1',
     agent: 'simulacao',
     anchor,
+    noPins: q.get('no_pins') === '1',
+    // O simulador vê as pausadas também: "por que minha regra não apareceu?" é
+    // a pergunta que ele existe para responder.
+    pinsAll: true,
   });
 
   return json({
     offer_id: out.offer_id,
     anchor,
+    // A âncora é o item de maior valor do carrinho, então `cart=` pode mudá-la.
+    // Devolver a efetiva evita o painel afirmar uma coisa e o motor outra.
+    anchor_effective: out.context.anchor,
     anchor_known: !!anchorRow,
     anchor_title: anchorRow?.title ?? null,
+    cart_skus: querSkus,
     context: out.context,
     relaxed: out.relaxed,
+    pins: out.pins,
+    // No simulador o descarte sai sempre: é aqui que alguém vai perguntar
+    // "por que minha regra não apareceu?". `n` vem junto porque o padrão do
+    // /offers é 10 e o da loja é bem menor — uma regra na vaga 3 pode agir aqui
+    // e nunca agir lá, e `slot_fora_do_alcance` é o que denuncia isso.
+    n: out.n,
+    pins_discarded: out.pinsDiscarded,
     offers: out.offers,
     rejected_summary: rejectSummary(out.rejected),
     rejected: out.debug ? out.rejected : undefined,
@@ -480,7 +690,20 @@ async function handleEvent(request, db) {
   const offerSku = body.offer_sku || dec.offer_sku;
   if (!offerSku) return json({ ok: true, ignored: 'no_offer_sku' });
 
-  const key = [row.brand, ctx.anchor || '', offerSku, ctx.surface || 'cart', ctx.goal || 'aov', ctx.segment || 'new'];
+  // Oferta que saiu por curadoria vai para um BRAÇO SEPARADO do bandit:
+  // `segment` já é coluna da PK de offer_stats, então a separação sai sem ALTER
+  // e sem PK nova — e o LEFT JOIN do /recommend liga o `segment` cru do request,
+  // logo as linhas `|pin` nunca voltam para o amostrador.
+  //
+  // O motivo não é higiene. O pin injeta exposição forçada, quase sempre na
+  // vaga 1, que converte melhor por POSIÇÃO e não por mérito. Misturado, um pin
+  // de 30 dias deixaria a posterior daquele braço tão dominante que o bandit
+  // continuaria escolhendo o mesmo SKU depois da regra expirar: o pin
+  // sobreviveria à própria expiração, e desligar a curadoria não mudaria nada.
+  const pinnedSkus = Array.isArray(dec.pinned_skus) ? dec.pinned_skus : [];
+  const segBase = ctx.segment || 'new';
+  const segment = pinnedSkus.includes(offerSku) ? `${segBase}|pin` : segBase;
+  const key = [row.brand, ctx.anchor || '', offerSku, ctx.surface || 'cart', ctx.goal || 'aov', segment];
   const cfg = mergeConfig((await db.all('SELECT * FROM brand_config WHERE brand = ?', [row.brand]))[0]);
 
   await db.run(
@@ -562,6 +785,20 @@ async function handleSetConfig(request, db) {
 // multi-linha a 4 produtos. Por isso a carga serializa os valores como literais
 // escapados e corta por tamanho de statement, não por número de parâmetros.
 const MAX_SQL_CHARS = 60000;
+
+// Declarados aqui, e não junto dos handlers de /pins, porque SPECS os lê na
+// avaliação do módulo — um `const` mais abaixo cairia na TDZ e o worker nem
+// carregaria.
+const PIN_COLS = ['brand', 'slot', 'trigger_type', 'trigger_key', 'offer_sku',
+  'trigger_field', 'trigger_value', 'surface', 'goal', 'priority', 'active',
+  'starts_at', 'ends_at', 'note', 'created_at', 'updated_at'];
+
+const MAX_SLOT = 10; // o teto de `n` em /recommend
+const MAX_CART_SIM = 30;    // itens do carrinho de teste em /offers?cart=
+// SKUs distintos do carrinho que viram bind. Cada um entra 3× nas subqueries de
+// kit, mais 7 parâmetros fixos: 300 × 3 + 7 = 907, abaixo do teto de 999 do
+// SQLite. Acima disso as travas de kit degradam; as de JS, não.
+const MAX_CART_BINDS = 300;
 
 const SPECS = {
   product: {
@@ -648,7 +885,671 @@ const SPECS = {
       return [brand, Number(r.n_orders) || 0];
     },
   },
+
+  // Curadoria em lote (o "salvar tudo" do painel).
+  //
+  // Upsert em vez de replace por causa de UMA coluna: `created_at` não é campo
+  // que o operador digita, e com `INSERT OR REPLACE` todo re-push do painel
+  // carimbava "agora" nele, apagando o instante real de criação de todas as
+  // regras. O conflito atualiza tudo menos ele.
+  pins: {
+    physical: 'pin_rule',
+    mode: 'upsert',
+    cols: PIN_COLS,
+    conflict: `ON CONFLICT (brand, slot, trigger_type, trigger_key, surface, goal) DO UPDATE SET
+       offer_sku = excluded.offer_sku,
+       trigger_field = excluded.trigger_field,
+       trigger_value = excluded.trigger_value,
+       priority = excluded.priority,
+       active = excluded.active,
+       starts_at = excluded.starts_at,
+       ends_at = excluded.ends_at,
+       note = excluded.note,
+       updated_at = excluded.updated_at`,
+    map: (r, ctx) => pinTuple({ ...r, brand: r.brand ?? ctx.meta.brand }, ctx.now),
+  },
 };
+
+// ---------------------------------------------------------------------------
+// /pins — curadoria manual
+// ---------------------------------------------------------------------------
+
+/** Escopo ausente ou vazio vale para todos — nunca undefined na coluna NOT NULL. */
+function pinScope(v) {
+  const s = v != null ? String(v).trim().toLowerCase() : '';
+  return s && s !== '*' ? s : '*';
+}
+
+// Os dois lados têm que espelhar: `VERDADEIRO` sem `FALSO` — que é exatamente o
+// par que um Excel em pt-BR exporta — carregaria as regras no ar e recusaria
+// TODAS as pausadas, deixando no ar justamente o que estava desligado.
+const SIM = new Set(['1', 't', 'true', 'y', 'yes', 's', 'sim', 'v', 'verdadeiro', 'on']);
+const NAO = new Set(['0', 'f', 'false', 'n', 'no', 'nao', 'não', 'falso', 'off']);
+
+/**
+ * `active` de uma regra: aceita o vocabulário que uma exportação de planilha
+ * realmente produz, e RECUSA o que não reconhece.
+ *
+ * O `truthy` genérico do arquivo trata tudo que não é `1|t|true` como falso —
+ * um lote com `active: "TRUE"` entraria com `applied: N`, `errors: []` e todas
+ * as regras pausadas em silêncio. Errar para o lado do erro visível é melhor:
+ * a linha ruim vira uma entrada em `errors[]` e alguém conserta.
+ */
+function pinActive(v) {
+  if (v === undefined || v === null || v === '') return 1;
+  if (v === true || v === 1) return 1;
+  if (v === false || v === 0) return 0;
+  const s = String(v).trim().toLowerCase();
+  if (SIM.has(s)) return 1;
+  if (NAO.has(s)) return 0;
+  throw new Error(`active não reconhecido: ${v}`);
+}
+
+/**
+ * Prioridade: número, ou erro. `Number('alta') || 0` virava 0 em silêncio, e o
+ * desempate que o operador configurou simplesmente não se aplicava — com
+ * `applied: N` e `errors: []` na resposta dizendo que deu tudo certo.
+ */
+function pinPriority(v) {
+  if (v === undefined || v === null || v === '') return 0;
+  const n = Number(v);
+  if (!Number.isFinite(n)) throw new Error(`priority não numérico: ${v}`);
+  return Math.round(n);
+}
+
+// Os separadores do `wire` do group_concat. Um SKU ou rótulo que os contenha
+// produziria um registro com contagem de campos errada, e `parsePinRules` o
+// descartaria em silêncio — a regra sumiria de todo /recommend sem erro.
+// Recusar na escrita é o único ponto em que dá para avisar alguém.
+const SEPARADORES = /[\u001e\u001f]/;
+
+function semSeparador(v, campo) {
+  if (v != null && SEPARADORES.test(String(v))) {
+    throw new Error(`${campo} contém caractere de controle reservado`);
+  }
+  return v;
+}
+
+/**
+ * Data → instante ISO em UTC, com o dia interpretado em BRT.
+ *
+ * Uma data pura como fim de vigência TEM que virar o FIM do dia: comparar
+ * '2026-12-31' com um ISO completo é falso a partir de 00:00:00Z, e a campanha
+ * morreria no próprio dia em que deveria valer. Normalizado aqui, na escrita,
+ * porque `resolvePins` compara string e precisa de um formato só.
+ */
+function pinInstant(v, borda) {
+  if (v == null || v === '') return null;
+  const s = String(v).trim();
+  let iso;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    iso = `${s}T${borda === 'fim' ? '23:59:59.999' : '00:00:00.000'}-03:00`;
+  } else if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(s)) {
+    // `datetime-local` do HTML manda exatamente isto, sem fuso. Entregue cru ao
+    // `new Date`, seria lido no fuso do HOST — o mesmo texto viraria instantes
+    // diferentes gravado do Worker (UTC) ou da máquina de quem opera (BRT), e
+    // "31/12 23:59" morreria às 20:59 do dia 31. Quem escreve pensa em BRT.
+    iso = `${s.replace(' ', 'T')}-03:00`;
+  } else if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/.test(s)) {
+    iso = s.replace(' ', 'T'); // fuso explícito: respeita-se como veio
+  } else {
+    // Recusar, não adivinhar. Assumir "já traz fuso" aceitava "12/31/2026" — que
+    // o `new Date` lê no fuso do HOST, o bug que este função existe para evitar —
+    // e "2026-12" ou "2026", que viram 1º de janeiro e expiram a campanha meses
+    // antes, sem erro nenhum.
+    throw new Error(`data em formato não reconhecido: ${v} (use AAAA-MM-DD, AAAA-MM-DDTHH:MM, ou ISO com fuso)`);
+  }
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) throw new Error(`data inválida: ${v}`);
+  return d.toISOString();
+}
+
+/**
+ * Valida e normaliza uma regra de curadoria, devolvendo a tupla de PIN_COLS.
+ * Lança com mensagem legível: o mapper de lote transforma isso em `errors[]`
+ * por linha, sem derrubar o resto da carga.
+ */
+function pinTuple(r, now) {
+  const brand = normBrand(r.brand);
+  if (!brand) throw new Error('brand obrigatório');
+
+  // Inteiro, não arredondado: `slot: 1.6` virando vaga 2 é o motor adivinhando
+  // onde o operador quis fixar. Todo o resto aqui recusa o que não entende.
+  const slot = Number(r.slot);
+  if (!Number.isInteger(slot) || slot < 1 || slot > MAX_SLOT) {
+    throw new Error(`slot tem que ser inteiro entre 1 e ${MAX_SLOT}: ${r.slot}`);
+  }
+
+  const tipo = String(r.trigger_type ?? '').trim().toLowerCase();
+  if (!Object.hasOwn(PIN_SPECIFICITY, tipo)) {
+    throw new Error(`trigger_type inválido: ${r.trigger_type} (use ${Object.keys(PIN_SPECIFICITY).join(', ')})`);
+  }
+
+  const offerSku = semSeparador(
+    r.offer_sku != null ? String(r.offer_sku).trim() : '', 'offer_sku',
+  );
+  if (!offerSku) throw new Error('offer_sku obrigatório');
+
+  let field = null;
+  let value = null;
+  let key = '';
+  if (tipo === 'sku') {
+    key = semSeparador(String(r.trigger_sku ?? r.trigger_key ?? '').trim(), 'trigger_sku');
+    if (!key) throw new Error('trigger_sku obrigatório quando trigger_type=sku');
+  } else if (tipo === 'taxonomy') {
+    field = String(r.trigger_field ?? '').trim().toLowerCase();
+    if (!PIN_TRIGGER_FIELDS.includes(field)) {
+      throw new Error(`trigger_field deve ser ${PIN_TRIGGER_FIELDS.join(', ')}`);
+    }
+    // Gravado já normalizado: no seed medido, BODY SPLASH e Body Splash são a
+    // mesma subcategoria. E "Não se aplica" é sentinela de ausência, não valor —
+    // normTax devolve vazio e a regra é recusada aqui, não em produção.
+    value = semSeparador(normTax(r.trigger_value), 'trigger_value');
+    if (!value) throw new Error('trigger_value vazio ou sem significado taxonômico');
+    key = `${field}=${value}`;
+  }
+
+  return [brand, slot, tipo, key, offerSku, field, value,
+    semSeparador(pinScope(r.surface), 'surface'),
+    semSeparador(pinScope(r.goal), 'goal'),
+    pinPriority(r.priority),
+    pinActive(r.active),
+    pinInstant(r.starts_at, 'inicio'),
+    pinInstant(r.ends_at, 'fim'),
+    r.note != null ? String(r.note) : null,
+    // Validado, não repassado cru: `sqlLiteral` roda DEPOIS, dentro do
+    // `bulkInsert`, fora do try/catch por linha — um `created_at` que não seja
+    // texto derrubava o lote inteiro com 500 e stack, em vez de virar uma
+    // entrada em `errors[]`.
+    r.created_at != null ? pinInstant(r.created_at, 'inicio') : now,
+    now];
+}
+
+/** A parte do gatilho que entra na chave. */
+function pinNaturalKey(body) {
+  const tipo = String(body.trigger_type ?? '').trim().toLowerCase();
+  if (tipo === 'sku') return String(body.trigger_sku ?? body.trigger_key ?? '').trim();
+  if (tipo === 'taxonomy') {
+    return `${String(body.trigger_field ?? '').trim().toLowerCase()}=${normTax(body.trigger_value)}`;
+  }
+  return '';
+}
+
+const PIN_ID_COLS = 'brand=? AND slot=? AND trigger_type=? AND trigger_key=? AND surface=? AND goal=?';
+
+/**
+ * Identidade completa de uma regra a partir de um corpo de request, ou null se
+ * o corpo não a determina. O `slot` é exigido INTEIRO aqui também: arredondar
+ * faria um `slot: 1.6` encontrar a regra da vaga 2 e sobrescrevê-la, com
+ * `created: false` e sem aviso nenhum — destruição silenciosa de dado.
+ */
+function pinIdentity(body) {
+  const brand = normBrand(body.brand);
+  const slot = Number(body.slot);
+  const tipo = String(body.trigger_type ?? '').trim().toLowerCase();
+  if (!brand || !Number.isInteger(slot) || slot < 1 || slot > MAX_SLOT || !tipo) return null;
+  return [brand, slot, tipo, pinNaturalKey(body), pinScope(body.surface), pinScope(body.goal)];
+}
+
+async function handleListPins(url, db) {
+  const q = url.searchParams;
+  const brand = normBrand(q.get('brand'));
+  const where = [];
+  const params = [];
+  if (brand) { where.push('r.brand = ?'); params.push(brand); }
+  const slotQ = q.get('slot');
+  if (slotQ) {
+    // Sem validar, `?slot=primeira` liga NaN, não casa com nada e a resposta é
+    // um `count: 0` tranquilo — dizendo ao operador que a vaga está livre
+    // enquanto a regra segue no ar fixando o carrinho.
+    const s = Number(slotQ);
+    if (!Number.isInteger(s) || s < 1 || s > MAX_SLOT) {
+      return json({ error: 'invalid_slot', slot: slotQ }, 400);
+    }
+    where.push('r.slot = ?');
+    params.push(s);
+  }
+  // Escopo é filtro de leitura também: sem ele, `?slot=1` devolve a regra do
+  // carrinho e a da PDP intercaladas, as duas com `effective: true`, e não há
+  // como o painel saber qual governa o carrinho.
+  // `IN (?, '*')` e não `= ?`: uma regra curinga TAMBÉM governa o carrinho, e
+  // filtrar literalmente escondia justamente as que mais mandam. Com o recorte,
+  // a lista passa a ser exatamente quem disputa aquele escopo.
+  let comEscopo = false;
+  for (const campo of ['surface', 'goal']) {
+    const v = q.get(campo);
+    if (v != null && v !== '') {
+      where.push(`r.${campo} IN (?, '*')`);
+      params.push(pinScope(v));
+      comEscopo = true;
+    }
+  }
+  const activeQ = q.get('active');
+  if (activeQ != null && activeQ !== '') {
+    // O mesmo vocabulário da escrita. Com o `truthy` genérico, `?active=sim`
+    // virava `active = 0` e o painel pedia as regras no ar e recebia as
+    // pausadas — a resposta mais enganosa possível para quem opera.
+    let v;
+    try { v = pinActive(activeQ); } catch {
+      return json({ error: 'invalid_active', active: activeQ }, 400);
+    }
+    where.push('r.active = ?');
+    params.push(v);
+  }
+
+  // O braço `|pin` do bandit sai aqui. Sem isto ele era só escrita: nenhuma
+  // rota o lia, e a promessa de "defender ou matar uma regra com número" não
+  // era alcançável pela API.
+  const rows = await db.all(
+    `SELECT r.*, p.sku AS catalogo_sku, p.title AS offer_title, p.price AS offer_price,
+            p.available AS offer_available,
+            (SELECT SUM(impressions) FROM offer_stats os
+              WHERE os.brand = r.brand AND os.offer_sku = r.offer_sku
+                AND os.segment LIKE '%|pin'
+                AND (r.surface = '*' OR os.surface = r.surface)
+                AND (r.goal = '*' OR os.goal = r.goal)) AS pin_impressions,
+            (SELECT SUM(accepts) FROM offer_stats os
+              WHERE os.brand = r.brand AND os.offer_sku = r.offer_sku
+                AND os.segment LIKE '%|pin'
+                AND (r.surface = '*' OR os.surface = r.surface)
+                AND (r.goal = '*' OR os.goal = r.goal)) AS pin_accepts
+       FROM pin_rule r
+       LEFT JOIN product p ON p.brand = r.brand AND p.sku = r.offer_sku
+      ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+      ORDER BY r.brand, r.slot`,
+    params,
+  );
+
+  const now = new Date().toISOString();
+  const vigente = (r) => Number(r.active) === 1
+    && !(r.ends_at && String(r.ends_at) < now)
+    && !(r.starts_at && String(r.starts_at) > now);
+
+  // A ordem dentro da vaga é a da DISPUTA, e vem do próprio comparador do
+  // engine — reescrevê-la em SQL criaria uma segunda versão da precedência que
+  // divergiria. Ordenar por `priority DESC` aqui, por exemplo, mostrava um
+  // `always` de prioridade 99 acima do `sku` que realmente vence, ensinando ao
+  // operador exatamente o modelo mental errado.
+  //
+  // Quem não está vigente vai para o fim: `comparePins` só compara
+  // especificidade, e `resolvePins` filtra validade ANTES de ordenar. Sem isto,
+  // uma regra pausada e mais específica aparecia em primeiro enquanto o motor
+  // aplicava outra — e a doc promete que "a primeira é a que venceria".
+  //
+  // Sem recorte de escopo a lista mistura regras que NUNCA disputam entre si —
+  // a de carrinho e a de PDP —, e aí "a primeira é a que venceria" não pode ser
+  // verdade para nenhuma das duas. Nesse caso as regras são agrupadas por
+  // escopo, e a ordem da disputa vale dentro de cada grupo. Com `?surface=` a
+  // pergunta fica bem-posta e a lista inteira responde a ela.
+  rows.sort((a, b) => (
+    String(a.brand).localeCompare(String(b.brand))
+    || a.slot - b.slot
+    || (comEscopo ? 0 : String(a.surface).localeCompare(String(b.surface))
+                       || String(a.goal).localeCompare(String(b.goal)))
+    || (vigente(b) ? 1 : 0) - (vigente(a) ? 1 : 0)
+    || comparePins(a, b)
+  ));
+
+  // O estado calculado vai junto: sem ele o painel teria que reimplementar a
+  // regra de validade em JavaScript e as duas versões divergiriam.
+  return json({
+    count: rows.length,
+    now,
+    rules: rows.map((r) => {
+      const expirada = !!(r.ends_at && String(r.ends_at) < now);
+      const naoComecou = !!(r.starts_at && String(r.starts_at) > now);
+      const { catalogo_sku: catalogo, pin_impressions: imp, pin_accepts: acc, ...regra } = r;
+      const impressoes = Number(imp) || 0;
+      return {
+        ...regra,
+        // Do PRODUTO fixado, não da regra: `offer_stats` tem marca, âncora,
+        // superfície, goal e segmento — não tem vaga nem gatilho. Duas regras
+        // que fixam o mesmo SKU no mesmo escopo compartilham este número, e
+        // chamá-lo de "desempenho da regra" seria dar ao operador uma precisão
+        // que o dado não tem. O nome diz o que é.
+        //
+        // Abaixo de 300 impressões a taxa mente, e é na cauda que ela aparece:
+        // `take_rate: null` é mais honesto que um número que ninguém deveria
+        // usar para decidir.
+        pinned_product_performance: {
+          impressions: impressoes,
+          accepts: Number(acc) || 0,
+          take_rate: impressoes >= 300 ? (Number(acc) || 0) / impressoes : null,
+          conclusive: impressoes >= 300,
+          scope: 'produto fixado nesta marca e escopo, somando todas as vagas',
+        },
+        expired: expirada,
+        not_started: naoComecou,
+        effective: Number(r.active) === 1 && !expirada && !naoComecou,
+        // Pela CHAVE do join, nunca por `title`: a coluna é anulável e vem de
+        // carga de planilha, então um produto sem título viraria "regra
+        // apontando para SKU que não existe" na cara do operador.
+        offer_in_catalog: catalogo != null,
+      };
+    }),
+  });
+}
+
+/** A linha existente que este corpo identifica, ou null. */
+async function pinAtual(db, body) {
+  const id = pinIdentity(body);
+  if (!id) return null;
+  return (await db.all(`SELECT * FROM pin_rule WHERE ${PIN_ID_COLS}`, id))[0] || null;
+}
+
+/**
+ * Colunas editáveis numa atualização parcial, cada uma com sua normalização.
+ * O gatilho e a vaga ficam de fora de propósito: mudá-los muda a identidade da
+ * regra, e isso é criar outra — não editar esta.
+ */
+function vazioRecusado(campo) {
+  throw new Error(`${campo} vazio: envie null para limpar, ou omita o campo`);
+}
+
+const PIN_EDITAVEL = {
+  offer_sku: (v) => {
+    const s = semSeparador(v != null ? String(v).trim() : '', 'offer_sku');
+    if (!s) throw new Error('offer_sku não pode ficar vazio');
+    return s;
+  },
+  // `surface` e `goal` NÃO entram: são identidade, como a vaga e o gatilho.
+  // Mesma guarda do `active`, pela mesma razão: um formulário que sempre envia
+  // o campo mandaria vazio no campo não tocado, e a prioridade configurada
+  // voltaria a 0 — trocando quem vence a vaga, com ok e sem aviso.
+  priority: (v) => {
+    if (v === '' || v === null) throw new Error('priority vazio: envie um número ou omita o campo');
+    return pinPriority(v);
+  },
+  // NÃO é o `pinActive` da criação. Lá, ausente vale 1 — é o default de uma
+  // regra nova. Aqui, `""` ou `null` é o que um formulário manda quando o campo
+  // não foi tocado, e cair no default de 1 REATIVA uma regra pausada em
+  // silêncio, colocando a oferta de volta na frente do shopper.
+  active: (v) => {
+    if (v === '' || v === null) throw new Error('active vazio: envie 0 ou 1, ou omita o campo');
+    return pinActive(v);
+  },
+  // `null` limpa a data de propósito; `""` é recusado pela mesma razão do
+  // `active` e do `priority`: é o que um formulário manda no campo não tocado, e
+  // aceitá-lo transformaria uma campanha de 30 dias numa regra eterna — o pin
+  // seguiria furando teto e piso depois da data de fim, com ok e sem aviso.
+  starts_at: (v) => (v === '' ? vazioRecusado('starts_at') : pinInstant(v, 'inicio')),
+  ends_at: (v) => (v === '' ? vazioRecusado('ends_at') : pinInstant(v, 'fim')),
+  note: (v) => (v != null ? String(v) : null),
+};
+
+async function handleSetPin(request, db) {
+  const body = await readJson(request);
+  const agora = new Date().toISOString();
+  const atual = await pinAtual(db, body);
+
+  let row;
+  if (atual) {
+    // Edição PARCIAL e atômica. Um `INSERT OR REPLACE` da linha mesclada em
+    // memória perderia a escrita concorrente de outra aba — e como é a mescla
+    // que torna `{"active": 0}` seguro, a escrita perdida seria uma pausa
+    // silenciosamente revertida, não um campo velho.
+    const cols = [];
+    const vals = [];
+    try {
+      for (const [k, norm] of Object.entries(PIN_EDITAVEL)) {
+        if (body[k] === undefined) continue;
+        cols.push(k);
+        vals.push(norm(body[k]));
+      }
+    } catch (e) {
+      return json({ error: 'invalid_rule', detail: String(e.message || e) }, 400);
+    }
+    if (!cols.length) return json({ error: 'nothing_to_update' }, 400);
+
+    cols.push('updated_at');
+    vals.push(agora);
+    // `surface` e `goal` são identidade: mudá-los cria outra regra, como a vaga
+    // e o gatilho. Por isso não estão em PIN_EDITAVEL e a chave usada aqui é a
+    // da linha encontrada, não a do corpo.
+    const id = [atual.brand, atual.slot, atual.trigger_type, atual.trigger_key,
+      atual.surface, atual.goal];
+    await db.run(
+      `UPDATE pin_rule SET ${cols.map((c) => `${c} = ?`).join(', ')} WHERE ${PIN_ID_COLS}`,
+      [...vals, ...id],
+    );
+    row = (await db.all(`SELECT * FROM pin_rule WHERE ${PIN_ID_COLS}`, id))[0];
+  } else {
+    let tuple;
+    try {
+      tuple = pinTuple(body, agora);
+    } catch (e) {
+      return json({ error: 'invalid_rule', detail: String(e.message || e) }, 400);
+    }
+    // `ON CONFLICT` e não `OR REPLACE`: se a linha aparecer entre o SELECT do
+    // `pinAtual` e esta escrita — outra aba salvando, ou um /curate/pins
+    // correndo junto —, `OR REPLACE` a sobrescreveria inteira e carimbaria
+    // `created_at`, desfazendo o cuidado que o spec do lote tem com ele.
+    await db.run(
+      `INSERT INTO pin_rule (${PIN_COLS.join(', ')})
+       VALUES (${PIN_COLS.map(() => '?').join(', ')})
+       ${SPECS.pins.conflict}`,
+      tuple,
+    );
+    row = (await db.all(`SELECT * FROM pin_rule WHERE ${PIN_ID_COLS}`,
+      [tuple[0], tuple[1], tuple[2], tuple[3], tuple[7], tuple[8]]))[0];
+  }
+
+  // A regra pode ter sumido entre a escrita e a releitura — outra aba no
+  // /pins/delete, ou um /curate/reset. Sem esta guarda, `row.brand` estoura um
+  // TypeError que o catch do topo devolve como 500 COM stack, e o operador
+  // recebe um rastro de pilha em vez de uma resposta. O 404 do delete existe
+  // pela mesma razão: desfecho ambíguo aqui é justamente o que não pode haver.
+  if (!row) {
+    return json({ error: 'rule_vanished', detail: 'a regra foi removida durante a escrita' }, 409);
+  }
+
+  // Não recusar SKU fora do catálogo: a ordem de carga não é garantida e a
+  // regra pode chegar antes do produto. Mas avisar, porque regra apontando para
+  // SKU fantasma é regra que nunca vai aparecer. Vale para o gatilho também: o
+  // casamento por SKU é exato, então um código com a caixa errada nunca dispara
+  // e sai como `gatilho_nao_casou`, indistinguível de carrinho que não bate.
+  const warnings = [];
+  const noCatalogo = async (sku) => (await db.all(
+    'SELECT 1 AS ok FROM product WHERE brand=? AND sku=?', [row.brand, sku],
+  ))[0];
+  if (!await noCatalogo(row.offer_sku)) {
+    warnings.push(`offer_sku ${row.offer_sku} não está no catálogo de ${row.brand}`);
+  }
+  if (row.trigger_type === 'sku' && !await noCatalogo(row.trigger_key)) {
+    warnings.push(`trigger_sku ${row.trigger_key} não está no catálogo de ${row.brand} — o casamento é exato, confira a grafia`);
+  }
+
+  // A vaga faz parte da identidade, então "mover de vaga" na verdade CRIA outra
+  // regra e deixa a antiga no ar. Pior: a desduplicação por produto faz a vaga
+  // MENOR vencer, então a regra antiga continua mandando e a edição parece não
+  // ter surtido efeito nenhum.
+  // Por PRODUTO, não pela regra inteira: a desduplicação do motor é por
+  // `offer_sku`, então qualquer regra de qualquer gatilho numa vaga menor
+  // apontando para o mesmo produto anula esta — e avisar só quando o gatilho
+  // também coincide deixava passar em silêncio o caso mais comum.
+  const candidatas = (await db.all(
+    `SELECT slot, trigger_type, surface, goal, starts_at, ends_at FROM pin_rule
+      WHERE brand=? AND offer_sku=? AND slot<>? AND active=1
+      ORDER BY slot`,
+    [row.brand, row.offer_sku, row.slot],
+  )).filter((g) => !(g.ends_at && String(g.ends_at) < agora)
+                && !(g.starts_at && String(g.starts_at) > agora));
+  // Só disputam de verdade quem pode estar no ar no MESMO request. Sem o
+  // recorte de escopo, uma regra de PDP acusava uma de carrinho de nunca ir
+  // aparecer — um alarme falso que convida a apagar uma regra que funciona.
+  const cruza = (a, b) => a === '*' || b === '*' || a === b;
+  const gemeas = Number(row.active) === 1
+    ? candidatas.filter((g) => cruza(g.surface, row.surface) && cruza(g.goal, row.goal))
+    : [];
+  const menores = gemeas.filter((g) => g.slot < row.slot);
+  if (menores.length) {
+    warnings.push(`${row.offer_sku} já está fixado na vaga ${menores.map((g) => g.slot).join(', ')}; a vaga menor vence e esta regra nunca vai aparecer`);
+  } else if (gemeas.length) {
+    warnings.push(`${row.offer_sku} também está fixado na vaga ${gemeas.map((g) => g.slot).join(', ')}; esta, por ser menor, é a que vai valer`);
+  }
+
+  return json({ ok: true, created: !atual, stored: row, warnings });
+}
+
+async function handleDeletePin(request, db) {
+  const body = await readJson(request);
+  const brand = normBrand(body.brand);
+  if (!brand) return json({ error: 'brand_required' }, 400);
+
+  // Inteiro aqui também — era o último caminho que arredondava. `slot: 1.6`
+  // apagava TODAS as regras da vaga 2 e respondia ok, que num delete é a forma
+  // mais cara possível de adivinhar.
+  const slot = body.slot != null && body.slot !== '' ? Number(body.slot) : null;
+  if (slot != null && (!Number.isInteger(slot) || slot < 1 || slot > MAX_SLOT)) {
+    return json({ error: 'invalid_slot', slot: body.slot }, 400);
+  }
+
+  // String vazia é ausência, não "tipo vazio". Um formulário que sempre envia o
+  // campo cairia no ramo de regra única e rodaria um DELETE que não casa com
+  // nada — devolvendo ok enquanto a regra segue no ar, fixando a vaga.
+  const tipo = body.trigger_type != null && String(body.trigger_type).trim() !== ''
+    ? String(body.trigger_type).trim().toLowerCase()
+    : null;
+
+  let escopo;
+  let onde;
+  let params;
+  if (tipo) {
+    if (slot == null) return json({ error: 'slot_required_with_trigger_type' }, 400);
+    if (!Object.hasOwn(PIN_SPECIFICITY, tipo)) {
+      return json({ error: 'invalid_trigger_type', trigger_type: body.trigger_type }, 400);
+    }
+    escopo = 'regra';
+    onde = PIN_ID_COLS;
+    params = [brand, slot, tipo, pinNaturalKey(body), pinScope(body.surface), pinScope(body.goal)];
+  } else if (slot != null) {
+    // Escopo é identidade em todo o resto da feature, e aqui era ignorado:
+    // limpar "a vaga 1 da PDP" apagava junto a regra do carrinho e respondia ok
+    // sem nomear o que destruiu. Informado, ele recorta; omitido, a vaga
+    // inteira é apagada mesmo — e a resposta diz quais regras se foram.
+    escopo = 'vaga';
+    onde = 'brand=? AND slot=?';
+    params = [brand, slot];
+    if (body.surface != null && body.surface !== '') {
+      onde += ' AND surface=?';
+      params.push(pinScope(body.surface));
+    }
+    if (body.goal != null && body.goal !== '') {
+      onde += ' AND goal=?';
+      params.push(pinScope(body.goal));
+    }
+  } else {
+    return json({ error: 'slot_or_trigger_type_required' }, 400);
+  }
+
+  // Conta ANTES de apagar, em vez de confiar no contador do driver. Nem todo
+  // driver devolve linhas afetadas, e um `null` tratado como sucesso recria
+  // exatamente o desfecho que o 404 existe para evitar: o operador acredita que
+  // removeu, e a regra continua decidindo o carrinho.
+  const alvos = await db.all(
+    `SELECT slot, trigger_type, trigger_key, surface, goal, offer_sku
+       FROM pin_rule WHERE ${onde} ORDER BY slot`, params,
+  );
+  if (!alvos.length) {
+    return json({ error: 'rule_not_found', brand, slot, scope: escopo }, 404);
+  }
+  await db.run(`DELETE FROM pin_rule WHERE ${onde}`, params);
+
+  const n = (await db.all(
+    'SELECT COUNT(*) AS n FROM pin_rule WHERE brand = ?', [brand],
+  ))[0].n;
+  return json({
+    ok: true, brand, scope: escopo, deleted: alvos.length,
+    // Nomear o que se foi: num delete por vaga, "apagou 3" não diz se levou
+    // junto a regra de outra superfície que ninguém queria perder.
+    rules: alvos.map((a) => ({ rule: `${a.slot}|${a.trigger_type}|${a.trigger_key}`, surface: a.surface, goal: a.goal, offer_sku: a.offer_sku })),
+    remaining: n,
+  });
+}
+
+/**
+ * Retenção do `decision_log` — o único crescimento sem teto do app.
+ *
+ * Toda chamada de /recommend, /offers e /event grava uma linha de ~690 bytes
+ * (medido em 19/09, 25 linhas amostradas). Não havia poda nenhuma: com as cinco
+ * marcas no ar isso é da ordem de 0,7 GB por milhão de chamadas, para sempre.
+ * O env.DB não avisa quando aperta — a escrita fica lenta antes de falhar, e a
+ * escrita está no caminho do shopper.
+ *
+ * Duas travas, de propósito diferentes:
+ *
+ *   `keep_days`  a de rotina. Tem de sobreviver à JANELA DE EVENTO: o /event
+ *                resolve a oferta lendo `decision_log WHERE offer_id = ?` e
+ *                devolve 404 se a linha se foi. Um `purchase` chega horas
+ *                depois do `impression`, então 7 dias é folga deliberada, não
+ *                estimativa.
+ *   `max_rows`   a válvula. Corta o excedente mesmo dentro da janela. Existe
+ *                para o banco não morrer num pico, e nesse caso ela PERDE
+ *                evento — é o preço de continuar respondendo, e está aqui
+ *                escrito para ninguém descobrir isso no incidente.
+ *
+ * Apaga em lotes limitados: um DELETE sobre milhões de linhas estoura o tempo
+ * do worker e volta sem ter apagado nada, que é o pior dos mundos.
+ */
+export const PRUNE_DEFAULTS = { keep_days: 7, max_rows: 2_000_000, batch: 5_000, max_batches: 20 };
+
+export async function pruneDecisionLog(db, opts = {}) {
+  const o = { ...PRUNE_DEFAULTS, ...opts };
+  const before = (await db.all('SELECT COUNT(*) AS n FROM decision_log'))[0].n;
+  const cutoff = new Date(Date.now() - o.keep_days * 86400_000).toISOString();
+
+  let deletedByAge = 0;
+  for (let i = 0; i < o.max_batches; i++) {
+    const r = await db.run(
+      `DELETE FROM decision_log WHERE offer_id IN (
+         SELECT offer_id FROM decision_log WHERE ts < ? ORDER BY ts LIMIT ?)`,
+      [cutoff, o.batch],
+    );
+    // O driver do env.DB nem sempre devolve linhas afetadas; conferir pelo total
+    // é o que funciona nos dois (node:sqlite nos testes, env.DB em produção).
+    const now = (await db.all('SELECT COUNT(*) AS n FROM decision_log'))[0].n;
+    const foi = before - deletedByAge - now;
+    deletedByAge += foi;
+    if (foi <= 0) break;
+    void r;
+  }
+
+  let deletedByCap = 0;
+  let restante = (await db.all('SELECT COUNT(*) AS n FROM decision_log'))[0].n;
+  for (let i = 0; i < o.max_batches && restante > o.max_rows; i++) {
+    const excedente = Math.min(o.batch, restante - o.max_rows);
+    await db.run(
+      `DELETE FROM decision_log WHERE offer_id IN (
+         SELECT offer_id FROM decision_log ORDER BY ts LIMIT ?)`,
+      [excedente],
+    );
+    const agora = (await db.all('SELECT COUNT(*) AS n FROM decision_log'))[0].n;
+    if (agora >= restante) break;
+    deletedByCap += restante - agora;
+    restante = agora;
+  }
+
+  return {
+    before, after: restante, cutoff,
+    deleted_by_age: deletedByAge, deleted_by_cap: deletedByCap,
+    truncated: deletedByAge >= o.batch * o.max_batches,
+  };
+}
+
+async function handlePrune(request, url, db) {
+  const q = url.searchParams;
+  const body = request.method === 'POST' ? await readJson(request).catch(() => ({})) : {};
+  const num = (k, lo, hi) => {
+    const v = body[k] ?? (q.get(k) != null ? Number(q.get(k)) : undefined);
+    return v == null || Number.isNaN(Number(v)) ? undefined : Math.max(lo, Math.min(hi, Number(v)));
+  };
+  const opts = {};
+  for (const [k, lo, hi] of [['keep_days', 1, 365], ['max_rows', 10_000, 50_000_000], ['batch', 100, 20_000], ['max_batches', 1, 200]]) {
+    const v = num(k, lo, hi);
+    if (v !== undefined) opts[k] = v;
+  }
+  return json({ ok: true, ...(await pruneDecisionLog(db, opts)) });
+}
 
 async function handleCurate(table, request, db) {
   if (!CURATE_TABLES.has(table)) {
@@ -686,7 +1587,15 @@ async function handleCurate(table, request, db) {
   );
 
   const total = (await db.all(`SELECT COUNT(*) AS n FROM ${physicalTable(table)}`))[0].n;
-  return json({ ok: true, table, received: rows.length, applied: n, table_rows: total, errors });
+
+  // Poda oportunista: a carga é diária e já está fora do caminho do shopper, o
+  // que a torna o lugar certo para pagar a retenção. Orçamento pequeno de
+  // propósito — a carga não pode virar refém da limpeza; o resto sai no /prune.
+  let pruned;
+  try { pruned = await pruneDecisionLog(db, { max_batches: 3 }); }
+  catch (e) { pruned = { error: String(e.message || e) }; }
+
+  return json({ ok: true, table, received: rows.length, applied: n, table_rows: total, errors, pruned });
 }
 
 async function bulkInsert(db, spec, tuples) {
@@ -786,7 +1695,7 @@ async function upsertPrior(db, r) {
 async function handleReset(url, db) {
   const table = url.searchParams.get('table');
   const brand = normBrand(url.searchParams.get('brand'));
-  const physical = physicalTable(table) || (['affinity', 'sku_orders', 'brand_orders', 'product', 'kit_components', 'offer_stats', 'decision_log'].includes(table) ? table : null);
+  const physical = physicalTable(table) || (['affinity', 'sku_orders', 'brand_orders', 'product', 'kit_components', 'offer_stats', 'decision_log', 'pin_rule'].includes(table) ? table : null);
   if (!physical) return json({ error: 'unknown_table', table }, 400);
   if (brand && physical !== 'decision_log') await db.run(`DELETE FROM ${physical} WHERE brand = ?`, [brand]);
   else await db.run(`DELETE FROM ${physical}`, []);
@@ -798,12 +1707,18 @@ async function handleReset(url, db) {
 // infra
 // ---------------------------------------------------------------------------
 
-async function guard(request, env, fn) {
-  const token = env.CURATE_TOKEN;
-  if (!token) return json({ error: 'curate_token_not_configured' }, 503);
+/** O request traz o bearer correto? Sem efeito colateral, para quem só precisa saber. */
+function autorizado(request, env) {
+  const token = env && env.CURATE_TOKEN;
+  if (!token) return false;
   const auth = request.headers.get('Authorization') || '';
   const given = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-  if (!timingSafeEqual(given, token)) return json({ error: 'unauthorized' }, 401);
+  return timingSafeEqual(given, token);
+}
+
+async function guard(request, env, fn) {
+  if (!env || !env.CURATE_TOKEN) return json({ error: 'curate_token_not_configured' }, 503);
+  if (!autorizado(request, env)) return json({ error: 'unauthorized' }, 401);
   return fn();
 }
 
